@@ -171,8 +171,9 @@ async function autoCloseDuplicates(): Promise<void> {
   }
   console.log("[DEBUG] GitHub token found");
 
-  const owner = process.env.GITHUB_REPOSITORY_OWNER;
-  const repo = process.env.GITHUB_REPOSITORY_NAME;
+  const repoFull = process.env.GITHUB_REPOSITORY;
+  const owner = process.env.GITHUB_REPOSITORY_OWNER || (repoFull ? repoFull.split('/')[0] : '');
+  const repo = process.env.GITHUB_REPOSITORY_NAME || (repoFull ? repoFull.split('/')[1] : '');
   if (!owner || !repo) {
     throw new Error(
       "GITHUB_REPOSITORY_OWNER and GITHUB_REPOSITORY_NAME environment variables are required"
