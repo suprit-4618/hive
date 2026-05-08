@@ -5,13 +5,13 @@ Contract (atomic inline-skill flow):
 The queen calls ``create_colony(colony_name, task, skill_name,
 skill_description, skill_body, skill_files?, tasks?)`` in a single
 call. The tool materializes
-``~/.hive/colonies/{colony_name}/.hive/skills/{skill_name}/`` from the
+``~/.hive/colonies/{colony_name}/skills/{skill_name}/`` from the
 inline content (writing SKILL.md and any supporting files), then forks
 the queen session into that colony. The skill is **colony-scoped** —
-discovered as project scope by that colony's workers, invisible to
-every other colony on the machine. Reusing an existing skill name
-inside the colony simply replaces the old skill — the queen owns her
-skill namespace inside the colony.
+surfaced via the ``colony_ui`` extra scope to that colony's workers,
+invisible to every other colony on the machine. Reusing an existing
+skill name inside the colony simply replaces the old skill — the queen
+owns her skill namespace inside the colony.
 
 We monkeypatch ``fork_session_into_colony`` so the test doesn't need a
 real queen / session directory. We also redirect ``$HOME`` so the test's
@@ -72,8 +72,8 @@ def patched_home(tmp_path, monkeypatch):
 
 
 def _colony_skill_path(home: Path, colony_name: str, skill_name: str) -> Path:
-    """Where the tool now materializes the skill (colony-scoped project dir)."""
-    return home / ".hive" / "colonies" / colony_name / ".hive" / "skills" / skill_name
+    """Where the tool now materializes the skill (colony-scoped, flat layout)."""
+    return home / ".hive" / "colonies" / colony_name / "skills" / skill_name
 
 
 @pytest.fixture
@@ -218,7 +218,7 @@ async def test_colony_inherits_queen_override_state(patched_home: Path, patched_
 
 @pytest.mark.asyncio
 async def test_happy_path_materializes_skill_under_colony_dir(patched_home: Path, patched_fork: list[dict]) -> None:
-    """Inline skill content is written to ~/.hive/colonies/{colony}/.hive/skills/{name}/."""
+    """Inline skill content is written to ~/.hive/colonies/{colony}/skills/{name}/."""
     executor, session = _make_executor()
 
     description = (
@@ -314,8 +314,8 @@ async def test_two_colonies_do_not_share_skill_namespace(patched_home: Path, pat
     )
     assert payload_b.get("status") == "created", payload_b
 
-    alpha_dir = patched_home / ".hive" / "colonies" / "alpha" / ".hive" / "skills"
-    bravo_dir = patched_home / ".hive" / "colonies" / "bravo" / ".hive" / "skills"
+    alpha_dir = patched_home / ".hive" / "colonies" / "alpha" / "skills"
+    bravo_dir = patched_home / ".hive" / "colonies" / "bravo" / "skills"
     user_skills = patched_home / ".hive" / "skills"
 
     # Each colony only contains its own skill
@@ -676,7 +676,7 @@ async def test_triggers_invalid_cron_fails_before_fork(patched_home: Path, patch
     assert "cron" in payload["error"]
     # Fork was not called, skill not materialized.
     assert len(patched_fork) == 0
-    assert not (patched_home / ".hive" / "colonies" / "bad_cron" / ".hive" / "skills" / "skill").exists()
+    assert not (patched_home / ".hive" / "colonies" / "bad_cron" / "skills" / "skill").exists()
 
 
 @pytest.mark.asyncio

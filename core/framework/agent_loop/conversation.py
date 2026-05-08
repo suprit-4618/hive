@@ -427,6 +427,7 @@ class NodeConversation:
         store: ConversationStore | None = None,
         run_id: str | None = None,
         compaction_buffer_tokens: int | None = None,
+        compaction_buffer_ratio: float | None = None,
         compaction_warning_buffer_tokens: int | None = None,
     ) -> None:
         self._system_prompt = system_prompt
@@ -449,6 +450,11 @@ class NodeConversation:
         # limit. If left as None the legacy threshold-based rule is
         # used, keeping old call sites behaving identically.
         self._compaction_buffer_tokens = compaction_buffer_tokens
+        # Ratio component of the hybrid buffer. Combines additively with
+        # _compaction_buffer_tokens so callers can express "reserve N tokens
+        # plus M% of the window" — the absolute floor matters on tiny
+        # windows, the ratio matters on large ones.
+        self._compaction_buffer_ratio = compaction_buffer_ratio
         self._compaction_warning_buffer_tokens = compaction_warning_buffer_tokens
         self._output_keys = output_keys
         self._store = store
@@ -898,19 +904,30 @@ class NodeConversation:
         """True when the conversation should be compacted before the
         next LLM call.
 
-        Buffer-based rule (Gap 7): trigger when the current estimate
-        plus the configured buffer would exceed the hard context limit.
-        Prevents compaction from firing only AFTER we're already over
-        the wire and forced into a reactive binary-split pass.
+        Hybrid buffer rule: the headroom reserved before compaction fires
+        is the SUM of an absolute fixed component and a ratio of the hard
+        context limit:
 
-        When no buffer is configured, falls back to the multiplicative
-        threshold the old callers were built around.
+            effective_buffer = compaction_buffer_tokens
+                             + compaction_buffer_ratio * max_context_tokens
+
+        The fixed component gives a floor on tiny windows; the ratio
+        keeps the trigger meaningful on large windows where any constant
+        buffer becomes a rounding error (an 8k buffer is 75% on a 32k
+        window but 96% on a 200k window). Compaction fires when the
+        current estimate would consume more than (limit - effective_buffer).
+
+        When neither component is configured, falls back to the legacy
+        multiplicative threshold so old callers keep behaving identically.
         """
         if self._max_context_tokens <= 0:
             return False
-        if self._compaction_buffer_tokens is not None:
-            budget = self._max_context_tokens - self._compaction_buffer_tokens
-            return self.estimate_tokens() >= max(0, budget)
+        fixed = self._compaction_buffer_tokens
+        ratio = self._compaction_buffer_ratio
+        if fixed is not None or ratio is not None:
+            effective_buffer = (fixed or 0) + (ratio or 0.0) * self._max_context_tokens
+            budget = self._max_context_tokens - effective_buffer
+            return self.estimate_tokens() >= max(0.0, budget)
         return self.estimate_tokens() >= self._max_context_tokens * self._compaction_threshold
 
     def compaction_warning(self) -> bool:
@@ -1567,6 +1584,7 @@ class NodeConversation:
             "max_context_tokens": self._max_context_tokens,
             "compaction_threshold": self._compaction_threshold,
             "compaction_buffer_tokens": self._compaction_buffer_tokens,
+            "compaction_buffer_ratio": self._compaction_buffer_ratio,
             "compaction_warning_buffer_tokens": (self._compaction_warning_buffer_tokens),
             "output_keys": self._output_keys,
         }
@@ -1616,6 +1634,7 @@ class NodeConversation:
             store=store,
             run_id=run_id,
             compaction_buffer_tokens=meta.get("compaction_buffer_tokens"),
+            compaction_buffer_ratio=meta.get("compaction_buffer_ratio"),
             compaction_warning_buffer_tokens=meta.get("compaction_warning_buffer_tokens"),
         )
         conv._meta_persisted = True

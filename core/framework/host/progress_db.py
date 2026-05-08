@@ -7,7 +7,7 @@ verify SOP gates before marking a task done. This gives cross-run memory
 that the existing per-iteration stall detectors don't have.
 
 The DB is driven by agents via the ``sqlite3`` CLI through
-``execute_command_tool``. This module handles framework-side lifecycle:
+``terminal_exec``. This module handles framework-side lifecycle:
 creation, migration, queen-side bulk seeding, stale-claim reclamation.
 
 Concurrency model:
@@ -264,7 +264,9 @@ def ensure_all_colony_dbs(colonies_root: Path | None = None) -> list[Path]:
     run the stale-claim reclaimer on all of them in one pass.
     """
     if colonies_root is None:
-        colonies_root = Path.home() / ".hive" / "colonies"
+        from framework.config import COLONIES_DIR
+
+        colonies_root = COLONIES_DIR
     if not colonies_root.is_dir():
         return []
 

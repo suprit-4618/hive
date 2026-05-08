@@ -16,7 +16,7 @@ from pydantic import Field
 from ..bridge import get_bridge
 from ..session import _active_profile
 from ..telemetry import log_tool_call
-from .lifecycle import _contexts
+from .lifecycle import _contexts, _ensure_context
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_tabs", params, result=result)
             return result
 
@@ -98,10 +98,14 @@ def register_tab_tools(mcp: FastMCP) -> None:
         profile: str | None = None,
     ) -> dict:
         """
-        Open a new browser tab and navigate to the given URL.
+        Open a browser tab at the given URL — preferred entry point.
 
-        The tab is automatically added to the agent's tab group.
-        This tool waits for the page to load before returning.
+        This is the agent's primary "go to a page" tool and the cold-start
+        entry point — if no browser context exists yet for the profile,
+        one is created transparently. The first call after a fresh
+        context reuses the seed ``about:blank`` tab; subsequent calls
+        open new tabs in the agent's tab group. Waits for the page to
+        load before returning.
 
         Args:
             url: URL to navigate to
@@ -120,13 +124,8 @@ def register_tab_tools(mcp: FastMCP) -> None:
             log_tool_call("browser_open", params, result=result)
             return result
 
-        ctx = _get_context(profile)
-        if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
-            log_tool_call("browser_open", params, result=result)
-            return result
-
         try:
+            _, ctx, _ = await _ensure_context(bridge, profile)
             # Reuse the seed about:blank tab from context.create on first open
             seed_tab = ctx.pop("_seedTabId", None)
             if seed_tab is not None:
@@ -193,7 +192,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_close", params, result=result)
             return result
 
@@ -272,7 +271,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_activate_tab", params, result=result)
             return result
 
@@ -296,102 +295,3 @@ def register_tab_tools(mcp: FastMCP) -> None:
                 duration_ms=(time.perf_counter() - start) * 1000,
             )
             return result
-
-    @mcp.tool()
-    async def browser_close_all(
-        keep_active: bool = True,
-        profile: str | None = None,
-    ) -> dict:
-        """
-        Close all browser tabs in the agent's group, optionally keeping active.
-
-        Args:
-            keep_active: If True (default), keep the active tab open.
-                If False, close ALL tabs (group remains but empty).
-            profile: Browser profile name (default: "default")
-
-        Returns:
-            Dict with number of closed tabs and remaining count
-        """
-        start = time.perf_counter()
-        params = {"keep_active": keep_active, "profile": profile}
-
-        bridge = get_bridge()
-        if not bridge or not bridge.is_connected:
-            result = {"ok": False, "error": "Browser extension not connected"}
-            log_tool_call("browser_close_all", params, result=result)
-            return result
-
-        ctx = _get_context(profile)
-        if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
-            log_tool_call("browser_close_all", params, result=result)
-            return result
-
-        try:
-            result = await bridge.list_tabs(ctx.get("groupId"))
-            tabs = result.get("tabs", [])
-            active_tab_id = ctx.get("activeTabId")
-
-            closed = 0
-            tabs_set = ctx.get("tabs") if isinstance(ctx.get("tabs"), set) else None
-            for tab in tabs:
-                tid = tab.get("id")
-                if keep_active and tid == active_tab_id:
-                    continue
-                try:
-                    await bridge.close_tab(tid)
-                    closed += 1
-                    if tabs_set is not None and tid is not None:
-                        tabs_set.discard(tid)
-                except Exception:
-                    pass
-
-            # Update active tab
-            if not keep_active:
-                ctx["activeTabId"] = None
-            else:
-                result = await bridge.list_tabs(ctx.get("groupId"))
-                remaining = result.get("tabs", [])
-                ctx["activeTabId"] = remaining[0].get("id") if remaining else None
-
-            result = {
-                "ok": True,
-                "closed_count": closed,
-                "remaining": len(tabs) - closed,
-            }
-            log_tool_call(
-                "browser_close_all",
-                params,
-                result=result,
-                duration_ms=(time.perf_counter() - start) * 1000,
-            )
-            return result
-        except Exception as e:
-            result = {"ok": False, "error": str(e)}
-            log_tool_call(
-                "browser_close_all",
-                params,
-                error=e,
-                duration_ms=(time.perf_counter() - start) * 1000,
-            )
-            return result
-
-    @mcp.tool()
-    async def browser_close_finished(
-        keep_active: bool = True,
-        profile: str | None = None,
-    ) -> dict:
-        """
-        Close all tabs except the active one.
-
-        This is a convenience wrapper around browser_close_all.
-
-        Args:
-            keep_active: If True (default), keep the active tab open.
-            profile: Browser profile name (default: "default")
-
-        Returns:
-            Dict with closed_count, skipped_count, and remaining tab count
-        """
-        return await browser_close_all(keep_active=keep_active, profile=profile)

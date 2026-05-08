@@ -189,6 +189,42 @@ async def test_upload_zip_bundle_places_in_queen_scope(client: TestClient, _seed
     assert (skill_dir / "scripts" / "helper.py").exists()
 
 
+async def test_create_colony_skill_writes_to_flat_path(client: TestClient, _seed_colony) -> None:
+    """POSTing a new colony skill must write to the flat ``colonies/{name}/skills/``
+    layout, not the legacy nested ``.hive/skills/`` path.
+    """
+    payload = {
+        "name": "new-flat-skill",
+        "description": "Created via UI",
+        "body": "## Body\nstuff\n",
+        "enabled": True,
+    }
+    resp = await client.post("/api/colonies/research_one/skills", json=payload)
+    assert resp.status == 201
+
+    flat_md = _seed_colony / "skills" / "new-flat-skill" / "SKILL.md"
+    nested_md = _seed_colony / ".hive" / "skills" / "new-flat-skill" / "SKILL.md"
+    assert flat_md.exists(), "new colony skill should land in flat skills/ dir"
+    assert not nested_md.exists(), "new colony skill must NOT land in legacy nested .hive/skills/"
+
+
+async def test_legacy_nested_colony_skill_still_lists(client: TestClient, _seed_colony) -> None:
+    """Pre-flatten colonies keep their skills under ``colonies/{name}/.hive/skills/``.
+    They must continue to surface in GET responses.
+    """
+    skill_dir = _seed_colony / ".hive" / "skills" / "legacy-flat-test"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: legacy-flat-test\ndescription: Legacy nested\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+
+    resp = await client.get("/api/colonies/research_one/skills")
+    assert resp.status == 200
+    rows = {r["name"]: r for r in (await resp.json())["skills"]}
+    assert "legacy-flat-test" in rows
+
+
 async def test_patch_does_not_mislabel_legacy_colony_skill_as_framework(client: TestClient, _seed_colony) -> None:
     """Regression: toggling a legacy colony skill (no ledger entry yet)
     must not stamp provenance=FRAMEWORK on the new entry. Before the fix,

@@ -180,7 +180,7 @@ def _colony_scope(manager: Any, colony_name: str) -> SkillScope | None:
 
     overrides_path = colony_home / "skills_overrides.json"
     store = SkillOverrideStore.load(overrides_path, scope_label=f"colony:{colony_name}")
-    write_dir = colony_home / ".hive" / "skills"
+    write_dir = colony_home / "skills"
 
     admin_manager = _build_admin_manager(queen_id=queen_id, colony_name=colony_name)
 
@@ -210,12 +210,13 @@ def _build_admin_manager(
     """Build a read-only SkillsManager for GET when no live session exists.
 
     Intentionally leaves ``project_root`` unset even for a colony: the
-    colony's ``.hive/skills/`` directory is surfaced via the ``colony_ui``
-    extra scope. Also routing it through ``project_root`` would double-
-    scan the same dir, and last-wins collision resolution would retag the
-    skills as ``source_scope="project"`` — which flips the provenance
-    fallback to ``PROJECT_DROPPED`` and drops ``editable`` to ``False``
-    for anything without an explicit override-store entry.
+    colony's ``skills/`` directory (and the legacy ``.hive/skills/`` for
+    pre-flatten colonies) is surfaced via the ``colony_ui`` extra scope.
+    Routing it through ``project_root`` would double-scan the same dir,
+    and last-wins collision resolution would retag the skills as
+    ``source_scope="project"`` — which flips the provenance fallback to
+    ``PROJECT_DROPPED`` and drops ``editable`` to ``False`` for anything
+    without an explicit override-store entry.
     """
     extras: list[ExtraScope] = []
     queen_overrides_path: Path | None = None
@@ -227,6 +228,10 @@ def _build_admin_manager(
     if colony_name:
         colony_home = COLONIES_DIR / colony_name
         colony_overrides_path = colony_home / "skills_overrides.json"
+        # Surface both the new flat path (where new skills are written) and
+        # the legacy nested path (left intact for pre-flatten colonies). UI
+        # writes always target the flat path; reads see both.
+        extras.append(ExtraScope(directory=colony_home / "skills", label="colony_ui", priority=3))
         extras.append(ExtraScope(directory=colony_home / ".hive" / "skills", label="colony_ui", priority=3))
     cfg = SkillsManagerConfig(
         queen_id=queen_id,
@@ -442,10 +447,18 @@ async def handle_list_all_skills(request: web.Request) -> web.Response:
         extras.append(ExtraScope(directory=QUEENS_DIR / qid / "skills", label="queen_ui", priority=2))
     # We intentionally don't plumb every colony's project_root into one
     # manager — discovery only allows a single project_root. For the
-    # aggregator we scan every colony's .hive/skills/ as a tagged extra
-    # scope instead. That keeps the xml-catalog-per-scope invariant
-    # intact without requiring N managers.
+    # aggregator we scan every colony's skills/ (and the legacy nested
+    # .hive/skills/ for pre-flatten colonies) as tagged extra scopes
+    # instead. That keeps the xml-catalog-per-scope invariant intact
+    # without requiring N managers.
     for cn in colony_names:
+        extras.append(
+            ExtraScope(
+                directory=COLONIES_DIR / cn / "skills",
+                label="colony_ui",
+                priority=3,
+            )
+        )
         extras.append(
             ExtraScope(
                 directory=COLONIES_DIR / cn / ".hive" / "skills",
@@ -923,7 +936,9 @@ async def handle_upload_skill(request: web.Request) -> web.Response:
 
     # Resolve the write target
     if scope_kind == "user":
-        write_dir = Path.home() / ".hive" / "skills"
+        from framework.config import HIVE_HOME
+
+        write_dir = HIVE_HOME / "skills"
         overrides_path: Path | None = None
         store: SkillOverrideStore | None = None
         affected_runtimes: list = []

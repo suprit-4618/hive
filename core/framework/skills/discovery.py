@@ -136,8 +136,12 @@ class SkillDiscovery:
                 self._scanned_dirs.append(user_agents)
                 all_skills.extend(self._scan_scope(user_agents, "user"))
 
-            # Hive-specific (higher precedence within user scope)
-            user_hive = home / ".hive" / "skills"
+            # Hive-specific (higher precedence within user scope). Honors
+            # HIVE_HOME so the desktop's per-user root (set via env) wins
+            # over the shared ``~/.hive`` location.
+            from framework.config import HIVE_HOME
+
+            user_hive = HIVE_HOME / "skills"
             if user_hive.is_dir():
                 self._scanned_dirs.append(user_hive)
                 all_skills.extend(self._scan_scope(user_hive, "user"))

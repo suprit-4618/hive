@@ -147,3 +147,55 @@ async def await_completion(
             )
             return last
         await asyncio.sleep(poll)
+
+
+def sweep_stale_in_progress(queens_root: Path) -> int:
+    """Rewrite any orphaned ``in_progress`` markers under ``queens_root`` to
+    ``failed``. Returns the count of rewritten markers.
+
+    Whatever process owned the original compaction is gone (server crash,
+    SIGKILL, etc.), so leaving the marker at ``in_progress`` would cause every
+    subsequent colony cold-load for that queen session to wait the full
+    ``await_completion`` timeout (default 180s) before falling through.
+
+    Called once during server bootstrap. Best-effort: any per-file failure is
+    logged and skipped — the sweep should never prevent the server from
+    coming up.
+    """
+    if not queens_root.exists():
+        return 0
+    cleaned = 0
+    try:
+        for queen_dir in queens_root.iterdir():
+            if not queen_dir.is_dir():
+                continue
+            sessions_dir = queen_dir / "sessions"
+            if not sessions_dir.exists():
+                continue
+            try:
+                for session_dir in sessions_dir.iterdir():
+                    if not session_dir.is_dir():
+                        continue
+                    status = get_status(session_dir)
+                    if status is None or status.get("status") != "in_progress":
+                        continue
+                    mark_failed(session_dir, "server restarted while compaction was in progress")
+                    cleaned += 1
+            except OSError:
+                logger.debug(
+                    "compaction_status: sweep failed under %s",
+                    sessions_dir,
+                    exc_info=True,
+                )
+    except OSError:
+        logger.debug(
+            "compaction_status: sweep failed under %s",
+            queens_root,
+            exc_info=True,
+        )
+    if cleaned:
+        logger.info(
+            "compaction_status: cleared %d stale 'in_progress' marker(s) at startup",
+            cleaned,
+        )
+    return cleaned

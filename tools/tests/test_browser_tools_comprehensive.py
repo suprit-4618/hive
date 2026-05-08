@@ -20,7 +20,6 @@ from gcu.browser.bridge import BeelineBridge
 from gcu.browser.tools.advanced import register_advanced_tools
 from gcu.browser.tools.inspection import register_inspection_tools
 from gcu.browser.tools.interactions import register_interaction_tools
-from gcu.browser.tools.lifecycle import register_lifecycle_tools
 from gcu.browser.tools.navigation import register_navigation_tools
 from gcu.browser.tools.tabs import register_tab_tools
 
@@ -107,22 +106,17 @@ class TestMultipleSubagentsTabGroups:
 
         mock_bridge.create_context = AsyncMock(side_effect=mock_create_context)
 
-        # Register tools first
-        register_lifecycle_tools(mcp)
-        browser_start = mcp._tool_manager._tools["browser_start"].fn
+        from gcu.browser.tools.lifecycle import _ensure_context
 
-        # Now patch for execution
-        with patch("gcu.browser.tools.lifecycle.get_bridge", return_value=mock_bridge):
-            # Simulate 3 different subagents starting browsers
-            results = await asyncio.gather(
-                browser_start(profile="agent_1"),
-                browser_start(profile="agent_2"),
-                browser_start(profile="agent_3"),
-            )
+        results = await asyncio.gather(
+            _ensure_context(mock_bridge, "agent_1"),
+            _ensure_context(mock_bridge, "agent_2"),
+            _ensure_context(mock_bridge, "agent_3"),
+        )
 
         # Each should have created a separate context
         assert mock_bridge.create_context.call_count == 3
-        assert all(r.get("ok") for r in results)
+        assert all(created for (_, _, created) in results)
 
     @pytest.mark.asyncio
     async def test_concurrent_tab_operations_different_groups(self, mcp: FastMCP, mock_bridge: MagicMock):
@@ -201,7 +195,7 @@ class TestComplexScriptExecution:
         """Test LinkedIn-style infinite feed scrolling with lazy loading."""
         scroll_calls = []
 
-        async def mock_scroll(tab_id: int, direction: str, amount: int = 500) -> dict:
+        async def mock_scroll(tab_id: int, direction: str, amount: int = 500, selector: str | None = None) -> dict:
             scroll_calls.append((tab_id, direction, amount))
             return {"ok": True}
 
@@ -709,11 +703,11 @@ class TestErrorHandling:
         mock_bridge = MagicMock(spec=BeelineBridge)
         mock_bridge.is_connected = False
 
-        register_lifecycle_tools(mcp)
-        browser_start = mcp._tool_manager._tools["browser_start"].fn
+        register_tab_tools(mcp)
+        browser_open = mcp._tool_manager._tools["browser_open"].fn
 
-        with patch("gcu.browser.tools.lifecycle.get_bridge", return_value=mock_bridge):
-            result = await browser_start(profile="test")
+        with patch("gcu.browser.tools.tabs.get_bridge", return_value=mock_bridge):
+            result = await browser_open(url="https://example.com", profile="test")
 
         assert result.get("ok") is False
         assert "not connected" in result.get("error", "").lower()

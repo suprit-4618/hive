@@ -236,6 +236,28 @@ class ColonyRuntime:
         self.batch_init_nudge: str | None = self._skills_manager.batch_init_nudge
 
         self._colony_id: str = colony_id or "primary"
+
+        # Ensure the colony task template exists. Idempotent — if the
+        # colony was created previously, this is a no-op (it just stamps
+        # last_seen_session_ids if a session id is provided later).
+        try:
+            import asyncio as _asyncio
+
+            from framework.tasks import TaskListRole, get_task_store
+            from framework.tasks.scoping import colony_task_list_id
+
+            _store = get_task_store()
+            _list_id = colony_task_list_id(self._colony_id)
+            try:
+                # Best-effort: schedule on the running loop, or do it inline
+                # if no loop is yet running (e.g. during construction).
+                _loop = _asyncio.get_running_loop()
+                _loop.create_task(_store.ensure_task_list(_list_id, role=TaskListRole.TEMPLATE))
+            except RuntimeError:
+                _asyncio.run(_store.ensure_task_list(_list_id, role=TaskListRole.TEMPLATE))
+        except Exception:
+            logger.debug("Failed to ensure colony task template", exc_info=True)
+
         self._accounts_prompt = accounts_prompt
         self._accounts_data = accounts_data
         self._tool_provider_map = tool_provider_map
@@ -252,6 +274,16 @@ class ColonyRuntime:
 
         self._event_bus = event_bus or EventBus(max_history=self._config.max_history)
         self._scoped_event_bus = StreamEventBus(self._event_bus, self._colony_id)
+
+        # Make the event bus visible to the task-system event emitters so
+        # task lifecycle events fan out to the same bus the rest of the
+        # system uses. Idempotent — last writer wins.
+        try:
+            from framework.tasks.events import set_default_event_bus
+
+            set_default_event_bus(self._event_bus)
+        except Exception:
+            logger.debug("Failed to register default task event bus", exc_info=True)
 
         self._llm = llm
         self._tools = tools or []
@@ -387,6 +419,19 @@ class ColonyRuntime:
     def _apply_pipeline_results(self) -> None:
         for stage in self._pipeline.stages:
             if stage.tool_registry is not None:
+                # Register task tools on the same registry every worker
+                # pulls from. Done here (not at worker spawn) so the
+                # colony's `_tools` snapshot includes them.
+                try:
+                    from framework.tasks.tools import register_task_tools
+
+                    register_task_tools(stage.tool_registry)
+                except Exception:
+                    logger.warning(
+                        "Failed to register task tools on pipeline registry",
+                        exc_info=True,
+                    )
+
                 tools = list(stage.tool_registry.get_tools().values())
                 if tools:
                     self._tools = tools
@@ -441,10 +486,18 @@ class ColonyRuntime:
         if colony_name:
             colony_home = COLONIES_DIR / colony_name
             colony_overrides_path = colony_home / "skills_overrides.json"
-            # Colony-scope SKILL.md dir is the project-scope from discovery's
-            # point of view (colony_dir is the project_root). Add it also as
-            # a tagged ``colony_ui`` scope so UI-created entries resolve with
-            # correct provenance.
+            # Surface both the new flat ``skills/`` (where new skills are
+            # written) and the legacy nested ``.hive/skills/`` (left intact
+            # for pre-flatten colonies) as tagged ``colony_ui`` scopes, so
+            # UI-created entries resolve with correct provenance regardless
+            # of which on-disk layout the colony has.
+            extras.append(
+                ExtraScope(
+                    directory=colony_home / "skills",
+                    label="colony_ui",
+                    priority=3,
+                )
+            )
             extras.append(
                 ExtraScope(
                     directory=colony_home / ".hive" / "skills",
@@ -772,6 +825,7 @@ class ColonyRuntime:
         tools: list[Any] | None = None,
         tool_executor: Callable | None = None,
         stream_id: str | None = None,
+        profile_name: str | None = None,
     ) -> list[str]:
         """Spawn worker clones and start them in the background.
 
@@ -801,7 +855,19 @@ class ColonyRuntime:
             raise RuntimeError("ColonyRuntime is not running")
 
         from framework.agent_loop.agent_loop import AgentLoop
+        from framework.host.worker_profiles import get_worker_profile
         from framework.storage.conversation_store import FileConversationStore
+
+        # Resolve the profile binding for this spawn. ``profile_name=None``
+        # means "use the default profile"; an unknown name silently falls
+        # back to default (the legacy single-template behavior). The
+        # resolved integrations map is threaded into Worker(...) so
+        # account_overrides() can pin its MCP tool calls.
+        _resolved_profile = (
+            get_worker_profile(self._colony_id, profile_name) if profile_name else None
+        )
+        _profile_name_resolved = _resolved_profile.name if _resolved_profile else (profile_name or "")
+        _profile_integrations = dict(_resolved_profile.integrations) if _resolved_profile else {}
 
         # Resolve per-spawn vs colony-default code identity
         spawn_spec = agent_spec or self._agent_spec
@@ -815,6 +881,30 @@ class ColonyRuntime:
         # ``_enabled_mcp_tools`` is a no-op so the default path is
         # unchanged.
         spawn_tools = self._apply_tool_allowlist(spawn_tools)
+
+        # Per-spawn MCP credential filter. The Tool Library always
+        # surfaces every credentialed MCP tool so users can pre-enable
+        # them, but a worker that can't actually call a tool because
+        # the provider has no live OAuth account shouldn't see it in
+        # the prompt at all. Drop those names here — the filter is
+        # spawn-time, so the moment the user authorises a provider
+        # the very next worker spawn picks up the new tools.
+        try:
+            from framework.credentials.validation import compute_unavailable_mcp_tools
+
+            candidate_names = {
+                getattr(t, "name", None) for t in spawn_tools if getattr(t, "name", None)
+            }
+            mcp_drop, mcp_messages = compute_unavailable_mcp_tools(candidate_names)
+            if mcp_drop:
+                spawn_tools = [t for t in spawn_tools if getattr(t, "name", None) not in mcp_drop]
+                logger.info(
+                    "Spawn-time MCP filter: dropped %d tool(s) without live credentials [%s]",
+                    len(mcp_drop),
+                    "; ".join(mcp_messages),
+                )
+        except Exception:
+            logger.debug("Spawn-time MCP credential filter failed", exc_info=True)
 
         # Colony progress tracker: when the caller supplied a db_path
         # in input_data, this worker is part of a SQLite task queue
@@ -909,6 +999,23 @@ class ColonyRuntime:
             # free-variable capture here.
             _provider = None if _db_path_pre_activated else (lambda mgr=self._skills_manager: mgr.skills_catalog_prompt)
 
+            # Task-system fields. Each worker owns its session task list;
+            # picked_up_from records the colony template entry it was
+            # spawned for, when applicable.
+            from framework.tasks.scoping import (
+                colony_task_list_id as _colony_list_id,
+                session_task_list_id as _session_list_id,
+            )
+
+            _worker_list_id = _session_list_id(worker_id, worker_id)
+            _picked_up = None
+            _template_id = input_data.get("__template_task_id") if isinstance(input_data, dict) else None
+            if _template_id is not None:
+                try:
+                    _picked_up = (_colony_list_id(self._colony_id), int(_template_id))
+                except (TypeError, ValueError):
+                    _picked_up = None
+
             agent_context = AgentContext(
                 runtime=self._make_runtime_adapter(worker_id),
                 agent_id=worker_id,
@@ -925,6 +1032,9 @@ class ColonyRuntime:
                 dynamic_skills_catalog_provider=_provider,
                 execution_id=worker_id,
                 stream_id=explicit_stream_id or f"worker:{worker_id}",
+                task_list_id=_worker_list_id,
+                colony_id=self._colony_id,
+                picked_up_from=_picked_up,
             )
 
             worker = Worker(
@@ -935,6 +1045,8 @@ class ColonyRuntime:
                 event_bus=self._scoped_event_bus,
                 colony_id=self._colony_id,
                 storage_path=worker_storage,
+                profile_name=_profile_name_resolved,
+                integrations=_profile_integrations,
             )
 
             self._workers[worker_id] = worker
@@ -957,6 +1069,7 @@ class ColonyRuntime:
         tasks: list[dict[str, Any]],
         *,
         tools_override: list[Any] | None = None,
+        profile_name: str | None = None,
     ) -> list[str]:
         """Spawn a batch of parallel workers, one per task spec.
 
@@ -982,11 +1095,15 @@ class ColonyRuntime:
             task_data = spec.get("data")
             if task_data is not None and not isinstance(task_data, dict):
                 task_data = {"value": task_data}
+            # Per-task profile_name override beats the batch-level default,
+            # so a fan-out can mix profiles (e.g. half tasks routed to
+            # Slack:work and half to Slack:personal).
             ids = await self.spawn(
                 task=task_text,
                 count=1,
                 input_data=task_data or {"task": task_text},
                 tools=tools_override,
+                profile_name=spec.get("profile_name") or profile_name,
             )
             worker_ids.extend(ids)
         return worker_ids

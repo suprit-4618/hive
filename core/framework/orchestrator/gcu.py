@@ -35,7 +35,7 @@ Follow these rules for reliable, efficient browser interaction.
 Use snapshot first for structure and ordinary controls; switch to
 screenshot when snapshot can't find or verify the target. Interaction
 tools (`browser_click`, `browser_type`, `browser_type_focused`,
-`browser_fill`, `browser_scroll`) wait 0.5 s for the page to settle
+`browser_scroll`) wait 0.5 s for the page to settle
 after a successful action, then attach a fresh snapshot under the
 `snapshot` key of their result — so don't call `browser_snapshot`
 separately after an interaction unless you need a newer view. Tune
@@ -140,8 +140,9 @@ shortcut dispatcher requires both), then releases in reverse order.
 ## Tab management
 
 Close tabs as soon as you're done with them — not only at the end of
-the task. `browser_close(target_id=...)` for one, `browser_close_finished()`
-for a full cleanup. Never accumulate more than 3 open tabs.
+the task. Use `browser_close(tab_id=...)` (or no arg to close the
+active tab); call it for each tab when cleaning up after a multi-tab
+workflow. Never accumulate more than 3 open tabs.
 `browser_tabs` reports an `origin` field: `"agent"` (you own it, close
 when done), `"popup"` (close after extracting), `"startup"`/`"user"`
 (leave alone).
@@ -157,7 +158,7 @@ cookie consent banners if they block content.
 - If `browser_snapshot` fails, try `browser_get_text` with a narrow
   selector as fallback.
 - If `browser_open` fails or the page seems stale, `browser_stop` →
-  `browser_start` → retry.
+  `browser_open(url)` to lazy-create a fresh context.
 
 ## `browser_evaluate`
 

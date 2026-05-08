@@ -3,6 +3,7 @@ import {
   extractLastPhase,
   sseEventToChatMessage,
   formatAgentDisplayName,
+  newTokenAccumulator,
   replayEventsToMessages,
 } from "./chat-helpers";
 import type { AgentEvent } from "@/api/types";
@@ -308,12 +309,44 @@ describe("sseEventToChatMessage", () => {
     expect(result!.id).toMatch(/^stream-t-\d+-chat$/);
   });
 
-  it("returns null for client_input_requested (handled in workspace.tsx)", () => {
+  it("converts single client_input_requested question to a queen-style bubble", () => {
     const event = makeEvent({
       type: "client_input_requested",
-      node_id: "chat",
+      node_id: "queen",
       execution_id: "abc",
-      data: { prompt: "What next?" },
+      data: {
+        questions: [{ id: "q0", prompt: "Which folder?" }],
+      },
+    });
+    const result = sseEventToChatMessage(event, "t");
+    expect(result).not.toBeNull();
+    expect(result!.content).toBe("Which folder?");
+    expect(result!.id).toMatch(/^ask-user-abc-/);
+  });
+
+  it("converts multi-question client_input_requested to a numbered list", () => {
+    const event = makeEvent({
+      type: "client_input_requested",
+      node_id: "queen",
+      execution_id: "abc",
+      data: {
+        questions: [
+          { id: "q0", prompt: "Which folder?" },
+          { id: "q1", prompt: "Which date range?" },
+        ],
+      },
+    });
+    const result = sseEventToChatMessage(event, "t");
+    expect(result).not.toBeNull();
+    expect(result!.content).toBe("1. Which folder?\n2. Which date range?");
+  });
+
+  it("returns null for client_input_requested with no questions (auto-wait park)", () => {
+    const event = makeEvent({
+      type: "client_input_requested",
+      node_id: "queen",
+      execution_id: "abc",
+      data: {},
     });
     expect(sseEventToChatMessage(event, "t")).toBeNull();
   });
@@ -668,6 +701,126 @@ describe("formatAgentDisplayName", () => {
 
   it("handles a single word", () => {
     expect(formatAgentDisplayName("agent")).toBe("Agent");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractLastPhase
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// TokenAccumulator (folded into replayEventsToMessages)
+// ---------------------------------------------------------------------------
+
+describe("replayEventsToMessages tokenAccumulator", () => {
+  it("sums llm_turn_complete payloads in a single pass", () => {
+    const events = [
+      makeEvent({
+        type: "llm_turn_complete",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "exec-1",
+        data: {
+          input_tokens: 100,
+          output_tokens: 50,
+          cached_tokens: 10,
+          cache_creation_tokens: 5,
+          cost_usd: 0.0015,
+        },
+      }),
+      makeEvent({
+        type: "llm_turn_complete",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "exec-2",
+        data: {
+          input_tokens: 200,
+          output_tokens: 75,
+          cached_tokens: 20,
+          cache_creation_tokens: 0,
+          cost_usd: 0.003,
+        },
+      }),
+    ];
+
+    const tokens = newTokenAccumulator();
+    replayEventsToMessages(
+      events,
+      "queen-dm",
+      "Alexandra",
+      undefined,
+      undefined,
+      tokens,
+    );
+
+    expect(tokens.input).toBe(300);
+    expect(tokens.output).toBe(125);
+    expect(tokens.cached).toBe(30);
+    expect(tokens.cacheCreated).toBe(5);
+    expect(tokens.costUsd).toBeCloseTo(0.0045, 5);
+  });
+
+  it("does not mutate the accumulator when no llm_turn_complete events", () => {
+    const events = [
+      makeEvent({
+        type: "execution_started",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "exec-1",
+      }),
+    ];
+    const tokens = newTokenAccumulator();
+    replayEventsToMessages(
+      events,
+      "queen-dm",
+      "Alexandra",
+      undefined,
+      undefined,
+      tokens,
+    );
+    expect(tokens.input).toBe(0);
+    expect(tokens.costUsd).toBe(0);
+  });
+
+  it("treats missing token fields as zero", () => {
+    const events = [
+      makeEvent({
+        type: "llm_turn_complete",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "exec-1",
+        data: { input_tokens: 50 }, // only one field set
+      }),
+    ];
+    const tokens = newTokenAccumulator();
+    replayEventsToMessages(
+      events,
+      "queen-dm",
+      "Alexandra",
+      undefined,
+      undefined,
+      tokens,
+    );
+    expect(tokens.input).toBe(50);
+    expect(tokens.output).toBe(0);
+    expect(tokens.cached).toBe(0);
+    expect(tokens.cacheCreated).toBe(0);
+    expect(tokens.costUsd).toBe(0);
+  });
+
+  it("is a no-op when accumulator is omitted", () => {
+    const events = [
+      makeEvent({
+        type: "llm_turn_complete",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "exec-1",
+        data: { input_tokens: 100 },
+      }),
+    ];
+    // Should not throw, and should return messages normally.
+    const restored = replayEventsToMessages(events, "queen-dm", "Alexandra");
+    expect(Array.isArray(restored)).toBe(true);
   });
 });
 

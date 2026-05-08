@@ -9,7 +9,6 @@ from framework.agents.queen.nodes import (
     _queen_character_core,
     _queen_role_independent,
     _queen_role_running,
-    _queen_style,
     _queen_tools_independent,
     _queen_tools_running,
 )
@@ -36,7 +35,6 @@ def print_planning_prompt(worker_identity: str | None = None) -> None:
     prompt = (
         _queen_character_core
         + _queen_role_planning
-        + _queen_style
         + _queen_tools_planning
         + _queen_behavior_always
         + _queen_behavior_planning
@@ -68,7 +66,6 @@ def print_building_prompt(worker_identity: str | None = None) -> None:
     prompt = (
         _queen_character_core
         + _queen_role_building
-        + _queen_style
         + _queen_tools_building
         + _queen_behavior_always
         + _queen_behavior_building
@@ -100,7 +97,6 @@ def print_staging_prompt(worker_identity: str | None = None) -> None:
     prompt = (
         _queen_character_core
         + _queen_role_staging
-        + _queen_style
         + _queen_tools_staging
         + _queen_behavior_always
         + _queen_behavior_staging
@@ -127,7 +123,6 @@ def print_running_prompt(worker_identity: str | None = None) -> None:
     prompt = (
         _queen_character_core
         + _queen_role_running
-        + _queen_style
         + _queen_tools_running
         + _queen_behavior_always
         + _queen_behavior_running
@@ -147,7 +142,6 @@ def print_independent_prompt() -> None:
     prompt = (
         _queen_character_core
         + _queen_role_independent
-        + _queen_style
         + _queen_tools_independent
         + _queen_behavior_always
         + _queen_behavior_independent

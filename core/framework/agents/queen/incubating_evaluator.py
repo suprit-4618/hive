@@ -1,9 +1,8 @@
 """One-shot LLM gate that decides if a queen DM is ready to fork a colony.
 
 The queen's ``start_incubating_colony`` tool calls :func:`evaluate` with
-the queen's recent conversation, a proposed ``colony_name``, and a
-one-paragraph ``intended_purpose``.  The evaluator returns a structured
-verdict:
+the queen's recent conversation and a proposed ``colony_name``.  The
+evaluator returns a structured verdict:
 
     {
         "ready": bool,
@@ -38,8 +37,8 @@ You gate whether a queen agent should commit to forking a persistent
 expensive: it ends the user's chat with this queen and the worker runs
 unattended afterward, so the spec must be settled before you approve.
 
-Read the conversation excerpt and the queen's proposed colony_name +
-intended_purpose, then decide.
+Read the conversation excerpt and the queen's proposed colony_name,
+then decide.
 
 APPROVE (ready=true) only when ALL of the following hold:
   1. The user has explicitly asked for work that needs to outlive this
@@ -128,11 +127,9 @@ def format_conversation_excerpt(messages: list[Message]) -> str:
 def _build_user_message(
     conversation_excerpt: str,
     colony_name: str,
-    intended_purpose: str,
 ) -> str:
     return (
         f"## Proposed colony name\n{colony_name}\n\n"
-        f"## Queen's intended_purpose\n{intended_purpose.strip()}\n\n"
         f"## Recent conversation (oldest → newest)\n{conversation_excerpt}\n\n"
         "Decide: should this queen be approved to enter INCUBATING phase?"
     )
@@ -189,7 +186,6 @@ async def evaluate(
     llm: Any,
     messages: list[Message],
     colony_name: str,
-    intended_purpose: str,
 ) -> dict[str, Any]:
     """Run the incubating evaluator against the queen's conversation.
 
@@ -200,14 +196,13 @@ async def evaluate(
         messages: The queen's conversation messages, oldest first.  The
             evaluator slices its own tail; pass the full list.
         colony_name: Validated colony slug.
-        intended_purpose: Queen's one-paragraph brief.
 
     Returns:
         ``{"ready": bool, "reasons": [str], "missing_prerequisites": [str]}``.
         Fail-closed on any error.
     """
     excerpt = format_conversation_excerpt(messages)
-    user_msg = _build_user_message(excerpt, colony_name, intended_purpose)
+    user_msg = _build_user_message(excerpt, colony_name)
 
     try:
         response = await llm.acomplete(

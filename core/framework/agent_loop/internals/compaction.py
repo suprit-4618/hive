@@ -16,7 +16,6 @@ import os
 import re
 import time
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 from framework.agent_loop.conversation import Message, NodeConversation
@@ -31,19 +30,38 @@ logger = logging.getLogger(__name__)
 LLM_COMPACT_CHAR_LIMIT: int = 240_000
 LLM_COMPACT_MAX_DEPTH: int = 10
 
-# Microcompaction: tools whose results can be safely cleared
+# Microcompaction: tools whose results can be safely cleared from context
+# because the agent can re-derive them on demand. The bar for inclusion is
+# "old result has no irreversible value": file content can be re-read, a
+# search can be re-run, a screenshot can be re-captured, terminal output can
+# be re-fetched, etc. Write / edit results are short confirmations whose
+# value is in the side effect, not the message — also fair game.
 COMPACTABLE_TOOLS: frozenset[str] = frozenset(
     {
+        # File ops — content lives on disk, re-readable.
         "read_file",
-        "run_command",
-        "web_search",
-        "web_fetch",
-        "grep_search",
-        "glob_search",
+        "search_files",
         "write_file",
         "edit_file",
+        "pdf_read",
+        # Terminal — re-runnable; advanced job/output tools produce verbose
+        # logs whose recent state is what matters.
+        "terminal_exec",
+        "terminal_rg",
+        "terminal_find",
+        "terminal_output_get",
+        "terminal_job_logs",
+        # Web / research — pages and queries can be re-fetched.
+        "web_scrape",
+        "search_papers",
+        "download_paper",
+        "search_wikipedia",
+        # Browser read-only inspection — current page state is what matters,
+        # old snapshots are stale by definition.
         "browser_screenshot",
-        "list_directory",
+        "browser_snapshot",
+        "browser_html",
+        "browser_get_text",
     }
 )
 
@@ -657,8 +675,10 @@ def write_compaction_debug_log(
     level: str,
     inventory: list[dict[str, Any]] | None,
 ) -> None:
-    """Write detailed compaction analysis to ~/.hive/compaction_log/."""
-    log_dir = Path.home() / ".hive" / "compaction_log"
+    """Write detailed compaction analysis to $HIVE_HOME/compaction_log/."""
+    from framework.config import HIVE_HOME
+
+    log_dir = HIVE_HOME / "compaction_log"
     log_dir.mkdir(parents=True, exist_ok=True)
 
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%f")
@@ -857,7 +877,7 @@ def build_emergency_summary(
                 if not all_files:
                     parts.append(
                         "NOTE: Large tool results may have been saved to files. "
-                        "Use list_directory to check the data directory."
+                        "Use search_files(target='files', path='.') to check the data directory."
                     )
         except Exception:
             parts.append("NOTE: Large tool results were saved to files. Use read_file(path='<path>') to read them.")

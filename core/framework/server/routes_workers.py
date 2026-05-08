@@ -67,11 +67,9 @@ async def handle_list_nodes(request: web.Request) -> web.Response:
     worker_session_id = request.query.get("session_id")
     if worker_session_id and session.worker_path:
         worker_session_id = safe_path_segment(worker_session_id)
-        from pathlib import Path
+        from framework.config import HIVE_HOME
 
-        state_path = (
-            Path.home() / ".hive" / "agents" / session.worker_path.name / "sessions" / worker_session_id / "state.json"
-        )
+        state_path = HIVE_HOME / "agents" / session.worker_path.name / "sessions" / worker_session_id / "state.json"
         if state_path.exists():
             try:
                 state = json.loads(state_path.read_text(encoding="utf-8"))

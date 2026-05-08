@@ -798,6 +798,110 @@ async def handle_session_colonies(request: web.Request) -> web.Response:
 _EVENTS_HISTORY_DEFAULT_LIMIT = 2000
 _EVENTS_HISTORY_MAX_LIMIT = 10000
 
+# Files at or below this size use the simple forward-scan path (cheap enough
+# that the seek-backward dance isn't worth it). Above this threshold we read
+# the tail directly from end-of-file so a 50 MB log doesn't have to be paged
+# through entirely just to surface the last 2000 lines.
+_EVENTS_HISTORY_REVERSE_TAIL_THRESHOLD_BYTES = 1 << 20  # 1 MB
+_EVENTS_HISTORY_REVERSE_TAIL_CHUNK_BYTES = 64 * 1024
+
+
+def _read_events_tail(events_path: Path, limit: int) -> tuple[list[dict], int, bool]:
+    """Read the tail of an append-only JSONL events log.
+
+    Returns ``(events, total, truncated)``.  ``events`` is at most ``limit``
+    lines, oldest-first.  ``total`` is the total number of non-blank lines in
+    the file (exact for the small-file path, exact for the large-file path
+    too — we do a separate fast newline-count pass).
+
+    Two paths:
+    - Small files (< ~1 MB): forward scan.  Cheap; gives an exact total for
+      free.  Defers ``json.loads`` to the bounded deque so we never parse a
+      line that's about to be dropped.
+    - Large files: seek to EOF and read backward in 64 KB chunks until we have
+      at least ``limit`` complete lines.  Parses only the tail.  ``total`` is
+      counted by a separate forward byte-scan that just counts newlines —
+      no JSON parse — so it stays cheap even for huge files.
+
+    Without these optimizations, mounting the chat for a long-running queen
+    with a ~50 k-event log used to spend most of its time inside ``json.loads``
+    on the server thread (and block the event loop while doing it).
+    """
+    from collections import deque
+
+    file_size = events_path.stat().st_size
+
+    if file_size <= _EVENTS_HISTORY_REVERSE_TAIL_THRESHOLD_BYTES:
+        tail_raw: deque[str] = deque(maxlen=limit)
+        total = 0
+        with open(events_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                total += 1
+                tail_raw.append(line)
+        events: list[dict] = []
+        for raw in tail_raw:
+            try:
+                events.append(json.loads(raw))
+            except json.JSONDecodeError:
+                continue
+        return events, total, total > len(events)
+
+    # Large-file path: read backward until we have enough lines.
+    import os as _os
+
+    chunk_size = _EVENTS_HISTORY_REVERSE_TAIL_CHUNK_BYTES
+    pieces: list[bytes] = []
+    newline_count = 0
+    with open(events_path, "rb") as fb:
+        fb.seek(0, _os.SEEK_END)
+        pos = fb.tell()
+        while pos > 0 and newline_count <= limit:
+            read_size = min(chunk_size, pos)
+            pos -= read_size
+            fb.seek(pos)
+            chunk = fb.read(read_size)
+            newline_count += chunk.count(b"\n")
+            pieces.append(chunk)
+    pieces.reverse()
+    blob = b"".join(pieces)
+
+    # Drop the leading partial line unless we read from offset 0.
+    raw_lines = blob.split(b"\n")
+    if pos > 0 and raw_lines:
+        raw_lines = raw_lines[1:]
+    decoded = [ln.decode("utf-8", errors="replace").strip() for ln in raw_lines]
+    decoded = [ln for ln in decoded if ln]
+    if len(decoded) > limit:
+        decoded = decoded[-limit:]
+
+    events = []
+    for raw in decoded:
+        try:
+            events.append(json.loads(raw))
+        except json.JSONDecodeError:
+            continue
+
+    # Separate fast pass for total: count newlines only, no JSON parse.
+    total = 0
+    with open(events_path, "rb") as fb:
+        while True:
+            chunk = fb.read(1 << 20)
+            if not chunk:
+                break
+            total += chunk.count(b"\n")
+    # File may end without a trailing newline; if so, the last non-empty line
+    # was missed. Count it.
+    if file_size > 0:
+        with open(events_path, "rb") as fb:
+            fb.seek(-1, _os.SEEK_END)
+            if fb.read(1) != b"\n":
+                total += 1
+
+    return events, total, total > len(events)
+
 
 async def handle_session_events_history(request: web.Request) -> web.Response:
     """GET /api/sessions/{session_id}/events/history — persisted eventbus log.
@@ -827,6 +931,9 @@ async def handle_session_events_history(request: web.Request) -> web.Response:
     recent N events". Long-running colonies have produced files with 50k+
     events; before this cap, restoring on page-mount shipped the whole thing
     down the wire and blocked the UI for seconds.
+
+    The actual file read runs in a worker thread via ``asyncio.to_thread`` so
+    it doesn't block the event loop while other requests are in flight.
     """
     session_id = request.match_info["session_id"]
 
@@ -852,24 +959,8 @@ async def handle_session_events_history(request: web.Request) -> web.Response:
             }
         )
 
-    # Tail the file using a bounded deque — O(limit) memory regardless
-    # of file size. No need to materialize the whole list only to slice it.
-    from collections import deque
-
-    tail: deque[dict] = deque(maxlen=limit)
-    total = 0
     try:
-        with open(events_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    evt = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                total += 1
-                tail.append(evt)
+        events, total, truncated = await asyncio.to_thread(_read_events_tail, events_path, limit)
     except OSError:
         return web.json_response(
             {
@@ -882,14 +973,13 @@ async def handle_session_events_history(request: web.Request) -> web.Response:
             }
         )
 
-    events = list(tail)
     return web.json_response(
         {
             "events": events,
             "session_id": session_id,
             "total": total,
             "returned": len(events),
-            "truncated": total > len(events),
+            "truncated": truncated,
             "limit": limit,
         }
     )
@@ -1004,8 +1094,10 @@ async def handle_delete_agent(request: web.Request) -> web.Response:
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
 
-    # Reject deletion of framework agents (~/.hive/agents/) — those are internal
-    hive_agents_dir = Path.home() / ".hive" / "agents"
+    # Reject deletion of framework agents ($HIVE_HOME/agents/) — those are internal
+    from framework.config import HIVE_HOME
+
+    hive_agents_dir = HIVE_HOME / "agents"
     if resolved.is_relative_to(hive_agents_dir):
         return web.json_response({"error": "Cannot delete framework agents"}, status=403)
 

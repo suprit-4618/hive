@@ -35,6 +35,11 @@ from framework.agents.queen.queen_tools_config import (
     tools_config_exists,
     update_queen_tools_config,
 )
+from framework.agents.queen.queen_tools_defaults import (
+    list_category_names,
+    queen_role_categories,
+    resolve_category_tools,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -172,8 +177,15 @@ def _render_mcp_servers(
     *,
     mcp_tool_names_by_server: dict[str, list[dict[str, Any]]],
     enabled_mcp_tools: list[str] | None,
+    connected_providers: set[str],
 ) -> list[dict[str, Any]]:
-    """Shape the mcp_tool_catalog entries for the API response."""
+    """Shape the mcp_tool_catalog entries for the API response.
+
+    Each tool carries an optional ``provider`` and ``provider_connected``
+    flag so the Tool Library can render greyed-out rows + a Connect
+    button for credentialed tools whose OAuth provider hasn't been
+    authorized yet.
+    """
     allowed: set[str] | None = None if enabled_mcp_tools is None else set(enabled_mcp_tools)
     servers: list[dict[str, Any]] = []
     for server_name in sorted(mcp_tool_names_by_server):
@@ -182,12 +194,17 @@ def _render_mcp_servers(
         for entry in entries:
             name = entry.get("name")
             enabled = True if allowed is None else name in allowed
+            provider = entry.get("provider") or None
             tools.append(
                 {
                     "name": name,
                     "description": entry.get("description", ""),
                     "input_schema": entry.get("input_schema", {}),
                     "enabled": enabled,
+                    "provider": provider,
+                    "provider_connected": (
+                        True if provider is None else provider in connected_providers
+                    ),
                 }
             )
         servers.append({"name": server_name, "tools": tools})
@@ -198,31 +215,51 @@ def _catalog_from_live_session(session: Any) -> dict[str, list[dict[str, Any]]]:
     """Rebuild a per-server tool catalog from a live queen session.
 
     The session's registry is authoritative — this reflects any hot-added
-    MCP servers since the manager-level snapshot was cached.
+    MCP servers since the manager-level snapshot was cached. We source
+    from the registry's full pre-credential-gate catalog so the Tool
+    Library can list credentialed tools whose provider hasn't been
+    authorized yet (the UI greys them out and offers a Connect button).
     """
     registry = getattr(session, "_queen_tool_registry", None)
     if registry is None:
         # session._queen_tools_by_name is a stash from create_queen; we
         # only have registry via the tools list, so reconstruct from the
-        # phase state instead.
+        # phase state instead. (No provider info available in this
+        # fallback — used only when the registry handle is absent.)
         phase_state = getattr(session, "phase_state", None)
         if phase_state is None:
             return {}
         mcp_names = getattr(phase_state, "mcp_tool_names_all", set()) or set()
         independent_tools = getattr(phase_state, "independent_tools", []) or []
-        result: dict[str, list[dict[str, Any]]] = {"(unknown)": []}
+        result: dict[str, list[dict[str, Any]]] = {"MCP Tools": []}
         for tool in independent_tools:
             if tool.name not in mcp_names:
                 continue
-            result["(unknown)"].append(
+            result["MCP Tools"].append(
                 {
                     "name": tool.name,
                     "description": tool.description,
                     "input_schema": tool.parameters,
+                    "provider": None,
                 }
             )
-        return result if result["(unknown)"] else {}
+        return result if result["MCP Tools"] else {}
 
+    full_catalog = (
+        registry.get_full_mcp_catalog() if hasattr(registry, "get_full_mcp_catalog") else {}
+    )
+    if full_catalog:
+        return {
+            server: sorted(
+                (dict(entry) for entry in entries),
+                key=lambda e: e.get("name", ""),
+            )
+            for server, entries in full_catalog.items()
+        }
+
+    # Legacy fallback for registries that pre-date `_mcp_full_catalog`.
+    # Same admission-filtered shape as before; the UI will still work,
+    # it just won't show provider-disconnected tools.
     server_map = getattr(registry, "_mcp_server_tools", {}) or {}
     tools_by_name = {t.name: t for t in registry.get_tools().values()}
     catalog: dict[str, list[dict[str, Any]]] = {}
@@ -237,6 +274,7 @@ def _catalog_from_live_session(session: Any) -> dict[str, list[dict[str, Any]]]:
                     "name": tool.name,
                     "description": tool.description,
                     "input_schema": tool.parameters,
+                    "provider": None,
                 }
             )
         catalog[server_name] = entries
@@ -315,6 +353,10 @@ async def handle_get_tools(request: web.Request) -> web.Response:
     enabled_mcp_tools = load_queen_tools_config(queen_id, mcp_catalog=catalog)
     is_role_default = not tools_config_exists(queen_id)
 
+    # Snapshot live OAuth providers so the UI can grey out rows whose
+    # credential isn't authorized yet and surface a Connect button.
+    connected_providers = _connected_providers()
+
     response = {
         "queen_id": queen_id,
         "enabled_mcp_tools": enabled_mcp_tools,
@@ -325,9 +367,58 @@ async def handle_get_tools(request: web.Request) -> web.Response:
         "mcp_servers": _render_mcp_servers(
             mcp_tool_names_by_server=catalog,
             enabled_mcp_tools=enabled_mcp_tools,
+            connected_providers=connected_providers,
         ),
+        "categories": _render_categories(queen_id, catalog),
+        "connected_providers": sorted(connected_providers),
     }
     return web.json_response(response)
+
+
+def _connected_providers() -> set[str]:
+    """Return the set of OAuth providers with at least one live account.
+
+    Reads the credential store directly so the answer is always fresh
+    (no cache to invalidate after a Connect/Disconnect round trip).
+    Returns an empty set if ``aden_tools`` is unavailable.
+    """
+    try:
+        from aden_tools.credentials.store_adapter import CredentialStoreAdapter
+
+        adapter = CredentialStoreAdapter.default()
+        return {
+            (a.get("provider") or "")
+            for a in adapter.get_all_account_info()
+            if a.get("provider")
+        }
+    except Exception:
+        logger.debug("Connected-providers snapshot unavailable", exc_info=True)
+        return set()
+
+
+def _render_categories(
+    queen_id: str,
+    mcp_catalog: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Expose the role-default category table to the frontend.
+
+    Each entry carries the category name, the resolved member tool names
+    (after ``@server:NAME`` shorthand expansion against the live catalog),
+    and ``in_role_default`` to flag categories that contribute to this
+    queen's role-based default. Lets the Tool Library group tools by
+    category alongside the per-server view.
+    """
+    applied = set(queen_role_categories(queen_id))
+    out: list[dict[str, Any]] = []
+    for name in list_category_names():
+        out.append(
+            {
+                "name": name,
+                "tools": resolve_category_tools(name, mcp_catalog),
+                "in_role_default": name in applied,
+            }
+        )
+    return out
 
 
 async def handle_patch_tools(request: web.Request) -> web.Response:

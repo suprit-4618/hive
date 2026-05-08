@@ -35,16 +35,6 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "use_insert_text": {"type": "boolean", "default": True},
         },
     },
-    "browser_fill": {
-        "description": "Fill an input element (clears existing content first).",
-        "params": {
-            "selector": {"type": "string", "required": True},
-            "value": {"type": "string", "required": True},
-            "tab_id": {"type": "integer"},
-            "profile": {"type": "string"},
-            "timeout_ms": {"type": "integer", "default": 30000},
-        },
-    },
     "browser_type_focused": {
         "description": (
             "Type text into the already-focused element. Use after browser_click_coordinate "
@@ -110,10 +100,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "browser_scroll": {
-        "description": "Scroll the page.",
+        "description": "Scroll the page or a specific scrollable container.",
         "params": {
             "direction": {"type": "string", "default": "down", "enum": ["up", "down", "left", "right"]},
             "amount": {"type": "integer", "default": 500},
+            "selector": {"type": "string"},
             "tab_id": {"type": "integer"},
             "profile": {"type": "string"},
         },

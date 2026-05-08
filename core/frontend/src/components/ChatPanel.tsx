@@ -13,6 +13,9 @@ import {
 } from "lucide-react";
 import WorkerRunBubble from "@/components/WorkerRunBubble";
 import type { WorkerRunGroup } from "@/components/WorkerRunBubble";
+import ChartToolDetail, {
+  type ChartToolEntry,
+} from "@/components/charts/ChartToolDetail";
 
 export interface ImageContent {
   type: "image_url";
@@ -91,6 +94,10 @@ interface ChatPanelProps {
   activeThread: string;
   /** When true, the input is disabled (e.g. during loading) */
   disabled?: boolean;
+  /** When true, only the send button is locked — the textarea stays typable.
+   *  Used during new-session bootstrap so the user can compose a follow-up
+   *  while the queen finishes warming up / streaming her first reply. */
+  sendLocked?: boolean;
   /** When false, the image attach button is hidden (model lacks vision support) */
   supportsImages?: boolean;
   /** Called when user clicks the stop button to cancel the queen's current turn */
@@ -151,8 +158,11 @@ interface ChatPanelProps {
   onStartNewSession?: () => void;
   /** When true, disable the start-new-session button (request in flight). */
   startingNewSession?: boolean;
-  /** Cumulative LLM token usage for this session */
-  tokenUsage?: { input: number; output: number };
+  /** Cumulative LLM token usage for this session.
+   *  `cached` (cache reads) and `cacheCreated` (cache writes) are subsets of
+   *  `input` — providers count both inside prompt_tokens. Display them
+   *  separately; do not add to a total. */
+  tokenUsage?: { input: number; output: number; cached?: number; cacheCreated?: number; costUsd?: number };
   /** Optional action element rendered on the right side of the "Conversation" header */
   headerAction?: React.ReactNode;
 }
@@ -198,7 +208,7 @@ export function toolHex(name: string): string {
 }
 
 export function ToolActivityRow({ content }: { content: string }) {
-  let tools: { name: string; done: boolean }[] = [];
+  let tools: ChartToolEntry[] = [];
   try {
     const parsed = JSON.parse(content);
     tools = parsed.tools || [];
@@ -232,52 +242,65 @@ export function ToolActivityRow({ content }: { content: string }) {
     if (counts.done > 0) donePills.push({ name, count: counts.done });
   }
 
+  // Per-call chart embeds: chart_render's result envelope carries the
+  // spec back, so the chat renders the same chart the server
+  // rasterized to PNG. Other tools stay pill-only by design.
+  const chartDetails = tools.filter((t) => t.name.startsWith("chart_"));
+
   return (
-    <div className="flex gap-3 pl-10">
-      <div className="flex flex-wrap items-center gap-1.5">
-        {runningPills.map((p) => {
-          const hex = toolHex(p.name);
-          return (
-            <span
-              key={`run-${p.name}`}
-              className="inline-flex items-center gap-1 text-[11px] px-2.5 py-0.5 rounded-full"
-              style={{
-                color: hex,
-                backgroundColor: `${hex}18`,
-                border: `1px solid ${hex}35`,
-              }}
-            >
-              <Loader2 className="w-2.5 h-2.5 animate-spin" />
-              {p.name}
-              {p.count > 1 && (
-                <span className="text-[10px] font-medium opacity-70">
-                  ×{p.count}
-                </span>
-              )}
-            </span>
-          );
-        })}
-        {donePills.map((p) => {
-          const hex = toolHex(p.name);
-          return (
-            <span
-              key={`done-${p.name}`}
-              className="inline-flex items-center gap-1 text-[11px] px-2.5 py-0.5 rounded-full"
-              style={{
-                color: hex,
-                backgroundColor: `${hex}18`,
-                border: `1px solid ${hex}35`,
-              }}
-            >
-              <Check className="w-2.5 h-2.5" />
-              {p.name}
-              {p.count > 1 && (
-                <span className="text-[10px] opacity-80">×{p.count}</span>
-              )}
-            </span>
-          );
-        })}
+    <div className="flex flex-col gap-0.5">
+      <div className="flex gap-3 pl-10">
+        <div className="flex flex-wrap items-center gap-1.5">
+          {runningPills.map((p) => {
+            const hex = toolHex(p.name);
+            return (
+              <span
+                key={`run-${p.name}`}
+                className="inline-flex items-center gap-1 text-[11px] px-2.5 py-0.5 rounded-full"
+                style={{
+                  color: hex,
+                  backgroundColor: `${hex}18`,
+                  border: `1px solid ${hex}35`,
+                }}
+              >
+                <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                {p.name}
+                {p.count > 1 && (
+                  <span className="text-[10px] font-medium opacity-70">
+                    ×{p.count}
+                  </span>
+                )}
+              </span>
+            );
+          })}
+          {donePills.map((p) => {
+            const hex = toolHex(p.name);
+            return (
+              <span
+                key={`done-${p.name}`}
+                className="inline-flex items-center gap-1 text-[11px] px-2.5 py-0.5 rounded-full"
+                style={{
+                  color: hex,
+                  backgroundColor: `${hex}18`,
+                  border: `1px solid ${hex}35`,
+                }}
+              >
+                <Check className="w-2.5 h-2.5" />
+                {p.name}
+                {p.count > 1 && (
+                  <span className="text-[10px] opacity-80">×{p.count}</span>
+                )}
+              </span>
+            );
+          })}
+        </div>
       </div>
+      {chartDetails.map((t, idx) => (
+        <ChartToolDetail
+          key={t.callKey ?? `${t.name}-${idx}`}
+          entry={t}
+        />
+      ))}
     </div>
   );
 }
@@ -913,6 +936,7 @@ export default function ChatPanel({
   isBusy,
   activeThread,
   disabled,
+  sendLocked,
   onCancel,
   onSteer,
   onCancelQueued,
@@ -1398,8 +1422,10 @@ export default function ChatPanel({
           );
         })}
 
-        {/* Show typing indicator while waiting for first queen response (disabled + empty chat) */}
-        {(isWaiting || (disabled && threadMessages.length === 0)) && (
+        {/* Show typing indicator while waiting for first queen response
+            (disabled / sendLocked + empty chat counts as warm-up). */}
+        {(isWaiting ||
+          ((disabled || sendLocked) && threadMessages.length === 0)) && (
           <div className="flex gap-3">
             <div
               className="flex-shrink-0 w-9 h-9 rounded-xl flex items-center justify-center overflow-hidden"
@@ -1482,11 +1508,41 @@ export default function ChatPanel({
                 Context: {fmt(queenUsage.estimatedTokens)}/{fmt(queenUsage.maxTokens)}
               </span>
             )}
-            {hasTokens && (
-              <span title="LLM tokens used this session (input + output)">
-                Tokens: {fmt(tokenUsage!.input + tokenUsage!.output)}
-              </span>
-            )}
+            {hasTokens && (() => {
+              const cached = tokenUsage!.cached ?? 0;
+              const created = tokenUsage!.cacheCreated ?? 0;
+              const cost = tokenUsage!.costUsd ?? 0;
+              // cached/created are subsets of input — never sum; surface separately.
+              // Cost can be < $0.01; show 4 decimals so small-model sessions aren't "$0.00".
+              const costStr = cost > 0 ? `$${cost.toFixed(4)}` : "—";
+              return (
+                <span className="group relative cursor-help transition-colors hover:text-muted-foreground">
+                  Tokens: {fmt(tokenUsage!.input + tokenUsage!.output)}
+                  <span
+                    role="tooltip"
+                    className="pointer-events-none invisible absolute bottom-full right-0 z-50 mb-2 whitespace-nowrap rounded-md border border-border bg-popover px-3 py-2 text-[11px] text-popover-foreground opacity-0 shadow-lg transition-[opacity,transform] duration-150 translate-y-1 group-hover:visible group-hover:opacity-100 group-hover:translate-y-0"
+                  >
+                    <span className="mb-1.5 block text-muted-foreground">
+                      LLM tokens used this session
+                    </span>
+                    <span className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5 tabular-nums">
+                      <span>Input</span>
+                      <span className="text-right">{fmt(tokenUsage!.input)}</span>
+                      <span className="pl-3 text-muted-foreground">cache read</span>
+                      <span className="text-right text-muted-foreground">{fmt(cached)}</span>
+                      <span className="pl-3 text-muted-foreground">cache write</span>
+                      <span className="text-right text-muted-foreground">{fmt(created)}</span>
+                      <span>Output</span>
+                      <span className="text-right">{fmt(tokenUsage!.output)}</span>
+                      <span className="mt-1 border-t border-border/50 pt-1">Cost</span>
+                      <span className="mt-1 border-t border-border/50 pt-1 text-right font-medium">
+                        {costStr}
+                      </span>
+                    </span>
+                  </span>
+                </span>
+              );
+            })()}
           </div>
         );
       })()}
@@ -1636,9 +1692,11 @@ export default function ChatPanel({
               placeholder={
                 disabled
                   ? "Connecting to agent..."
-                  : isBusy
-                    ? "Queue a message — or click Steer to inject now..."
-                    : "Message Queen Bee..."
+                  : sendLocked
+                    ? "Type ahead — send unlocks once the queen is ready..."
+                    : isBusy
+                      ? "Queue a message — or click Steer to inject now..."
+                      : "Message Queen Bee..."
               }
               disabled={disabled}
               className="flex-1 bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground disabled:opacity-50 disabled:cursor-not-allowed resize-none overflow-y-auto"
@@ -1656,12 +1714,16 @@ export default function ChatPanel({
             <button
               type="submit"
               disabled={
-                (!input.trim() && pendingImages.length === 0) || disabled
+                (!input.trim() && pendingImages.length === 0) ||
+                disabled ||
+                sendLocked
               }
               title={
-                isBusy
-                  ? "Queue message — sent after the current turn, or click Steer on the bubble to send now"
-                  : "Send"
+                sendLocked
+                  ? "Hold tight — the queen is starting up. Send unlocks once she's ready."
+                  : isBusy
+                    ? "Queue message — sent after the current turn, or click Steer on the bubble to send now"
+                    : "Send"
               }
               className={`p-2 rounded-lg disabled:opacity-30 hover:opacity-90 transition-opacity ${
                 isBusy

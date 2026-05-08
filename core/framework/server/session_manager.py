@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from framework.config import QUEENS_DIR
+from framework.config import QUEENS_DIR, get_max_tokens
 from framework.host.triggers import TriggerDefinition
 
 logger = logging.getLogger(__name__)
@@ -546,8 +546,10 @@ class SessionManager:
         session.colony_name = colony_id
         session.worker_path = agent_path
 
-        # Worker storage: ~/.hive/agents/{colony_name}/{worker_name}/
-        worker_storage = Path.home() / ".hive" / "agents" / colony_id / worker_name
+        # Worker storage: $HIVE_HOME/agents/{colony_name}/{worker_name}/
+        from framework.config import HIVE_HOME
+
+        worker_storage = HIVE_HOME / "agents" / colony_id / worker_name
         worker_storage.mkdir(parents=True, exist_ok=True)
 
         # Copy conversations from colony if fresh
@@ -698,7 +700,10 @@ class SessionManager:
             available_tools=all_tools,
             goal_context=goal.to_prompt_context(),
             goal=goal,
-            max_tokens=8192,
+            # Worker output cap — pull from configuration.json instead of
+            # hard-coding 8192. glm-5.1/kimi-k2.5 both support 32k out, and
+            # capping at 8k silently truncates long worker turns mid-tool.
+            max_tokens=get_max_tokens(),
             stream_id=worker_name,
             execution_id=worker_name,
             identity_prompt=worker_data.get("identity_prompt", ""),
@@ -927,7 +932,9 @@ class SessionManager:
            that process is still running on the host. If it is, the session is
            owned by another healthy worker process, so leave it alone.
         """
-        sessions_path = Path.home() / ".hive" / "agents" / agent_path.name / "sessions"
+        from framework.config import HIVE_HOME
+
+        sessions_path = HIVE_HOME / "agents" / agent_path.name / "sessions"
         if not sessions_path.exists():
             return
 
@@ -1918,73 +1925,38 @@ class SessionManager:
             if meta.get("colony_fork"):
                 continue
 
-            # Build a quick preview of the last human/assistant exchange.
-            # We read all conversation parts, filter to client-facing messages,
-            # and return the last assistant message content as a snippet.
+            # Preview of the last client-facing exchange. Cached in
+            # ``summary.json`` next to ``meta.json`` so the sidebar doesn't
+            # have to rescan every part on each list call. The cache is
+            # written incrementally by FileConversationStore.write_part; if
+            # missing or stale (parts dir mtime newer than the summary file)
+            # we do a one-time full rebuild and write a fresh summary.
+            #
+            # NOTE on activity timestamps: the session directory's own mtime
+            # is NOT reliable as a "last activity" marker — POSIX dir mtime
+            # only updates when direct entries change, and conversation
+            # parts live under conversations/parts/, so writing a new part
+            # does not bubble up to the session dir.
+            from framework.storage import session_summary
+
             last_message: str | None = None
             message_count: int = 0
-            # Last-activity timestamp — mtime of the latest client-facing message.
-            # Falls back to session creation time for empty sessions. NOTE: the
-            # session directory's own mtime is NOT reliable here — POSIX dir mtime
-            # only updates when direct entries change, and conversation parts are
-            # nested under conversations/parts/, so writing a new part does not
-            # bubble up to the session dir.
             last_active_at: float = float(created_at) if isinstance(created_at, (int, float)) else 0.0
             convs_dir = d / "conversations"
+
+            summary: dict | None = None
             if convs_dir.exists():
-                try:
-                    all_parts: list[dict] = []
+                if session_summary.is_stale(d):
+                    summary = session_summary.rebuild_summary(d)
+                else:
+                    summary = session_summary.read_summary(d)
 
-                    def _collect_parts(parts_dir: Path, _dest: list[dict] = all_parts) -> None:
-                        if not parts_dir.exists():
-                            return
-                        for part_file in sorted(parts_dir.iterdir()):
-                            if part_file.suffix != ".json":
-                                continue
-                            try:
-                                part = json.loads(part_file.read_text(encoding="utf-8"))
-                                part.setdefault("created_at", part_file.stat().st_mtime)
-                                _dest.append(part)
-                            except (json.JSONDecodeError, OSError):
-                                continue
-
-                    # Flat layout: conversations/parts/*.json
-                    _collect_parts(convs_dir / "parts")
-                    # Node-based layout: conversations/<node_id>/parts/*.json
-                    for node_dir in convs_dir.iterdir():
-                        if not node_dir.is_dir() or node_dir.name == "parts":
-                            continue
-                        _collect_parts(node_dir / "parts")
-                    # Filter to client-facing messages only
-                    client_msgs = [
-                        p
-                        for p in all_parts
-                        if not p.get("is_transition_marker")
-                        and p.get("role") != "tool"
-                        and not (p.get("role") == "assistant" and p.get("tool_calls"))
-                    ]
-                    client_msgs.sort(key=lambda m: m.get("created_at", m.get("seq", 0)))
-                    message_count = len(client_msgs)
-                    # Take the latest message's timestamp as the activity marker.
-                    # _collect_parts sets created_at via setdefault to the part
-                    # file's mtime, so this is always a valid float.
-                    if client_msgs:
-                        latest_ts = client_msgs[-1].get("created_at")
-                        if isinstance(latest_ts, (int, float)) and latest_ts > last_active_at:
-                            last_active_at = float(latest_ts)
-                    # Last assistant message as preview snippet
-                    for msg in reversed(client_msgs):
-                        content = msg.get("content") or ""
-                        if isinstance(content, list):
-                            # Anthropic-style content blocks
-                            content = " ".join(
-                                b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
-                            )
-                        if content and msg.get("role") == "assistant":
-                            last_message = content[:120].strip()
-                            break
-                except OSError:
-                    pass
+            if summary is not None:
+                message_count = int(summary.get("message_count") or 0)
+                last_message = summary.get("last_message")
+                cached_active = summary.get("last_active_at")
+                if isinstance(cached_active, (int, float)) and cached_active > last_active_at:
+                    last_active_at = float(cached_active)
 
             # Derive queen_id from directory structure: queens/{queen_id}/sessions/{session_id}
             queen_id = d.parent.parent.name if d.parent.name == "sessions" else None

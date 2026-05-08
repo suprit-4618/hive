@@ -1042,6 +1042,49 @@ print(json.dumps(config, indent=2))
 PY
 }
 
+save_vision_fallback() {
+    # Write the `vision_fallback` block to ~/.hive/configuration.json.
+    # Args: provider_id, model, env_var (api_key_env_var), api_base (optional)
+    # When provider_id is empty, REMOVE the block entirely (user opted out).
+    local provider_id="$1"
+    local model="$2"
+    local env_var="$3"
+    local api_base="${4:-}"
+
+    uv run python - "$provider_id" "$model" "$env_var" "$api_base" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+provider_id, model, env_var, api_base = sys.argv[1:5]
+
+cfg_path = Path.home() / ".hive" / "configuration.json"
+cfg_path.parent.mkdir(parents=True, exist_ok=True)
+
+try:
+    with open(cfg_path, encoding="utf-8-sig") as f:
+        config = json.load(f)
+except (OSError, json.JSONDecodeError):
+    config = {}
+
+# Empty provider_id means the user opted out — drop the block.
+if not provider_id:
+    config.pop("vision_fallback", None)
+else:
+    block = {"provider": provider_id, "model": model}
+    if env_var:
+        block["api_key_env_var"] = env_var
+    if api_base:
+        block["api_base"] = api_base
+    config["vision_fallback"] = block
+
+tmp_path = cfg_path.with_name(cfg_path.name + ".tmp")
+with open(tmp_path, "w", encoding="utf-8") as f:
+    json.dump(config, f, indent=2)
+tmp_path.replace(cfg_path)
+PY
+}
+
 # Source shell rc file to pick up existing env vars (temporarily disable set -e)
 set +e
 if [ -f "$SHELL_RC_FILE" ]; then
@@ -1309,9 +1352,11 @@ fi
 echo ""
 echo -e "  ${CYAN}${BOLD}API key providers:${NC}"
 
-# 8-13) API key providers — show (credential detected) if key already set
-PROVIDER_MENU_ENVS=(ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GROQ_API_KEY CEREBRAS_API_KEY OPENROUTER_API_KEY)
-PROVIDER_MENU_NAMES=("Anthropic (Claude) - Recommended" "OpenAI (GPT)" "Google Gemini - Free tier available" "Groq - Fast, free tier" "Cerebras - Fast, free tier" "OpenRouter - Bring any OpenRouter model")
+# 8-N) API key providers — show (credential detected) if key already set.
+# Order is reflected directly in the menu numbering; the case dispatcher
+# below resolves choice numbers via $((8 + index_in_arrays)).
+PROVIDER_MENU_ENVS=(ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GROQ_API_KEY CEREBRAS_API_KEY OPENROUTER_API_KEY DEEPSEEK_API_KEY)
+PROVIDER_MENU_NAMES=("Anthropic (Claude) - Recommended" "OpenAI (GPT)" "Google Gemini - Free tier available" "Groq - Fast, free tier" "Cerebras - Fast, free tier" "OpenRouter - Bring any OpenRouter model" "DeepSeek - V4 family")
 for idx in "${!PROVIDER_MENU_ENVS[@]}"; do
     num=$((idx + 8))
     env_var="${PROVIDER_MENU_ENVS[$idx]}"
@@ -1322,14 +1367,16 @@ for idx in "${!PROVIDER_MENU_ENVS[@]}"; do
     fi
 done
 
-# 14) Local (Ollama) — no API key needed
+# Local (Ollama) — slot computed from the provider list so adding/removing
+# API-key providers above doesn't require renumbering by hand.
+OLLAMA_CHOICE=$((8 + ${#PROVIDER_MENU_ENVS[@]}))
 if [ "$OLLAMA_DETECTED" = true ]; then
-    echo -e "  ${CYAN}14)${NC} Local (Ollama) - No API key needed  ${GREEN}(ollama detected)${NC}"
+    echo -e "  ${CYAN}$OLLAMA_CHOICE)${NC} Local (Ollama) - No API key needed  ${GREEN}(ollama detected)${NC}"
 else
-    echo -e "  ${CYAN}14)${NC} Local (Ollama) - No API key needed"
+    echo -e "  ${CYAN}$OLLAMA_CHOICE)${NC} Local (Ollama) - No API key needed"
 fi
 
-SKIP_CHOICE=$((8 + ${#PROVIDER_MENU_ENVS[@]} + 1))
+SKIP_CHOICE=$((OLLAMA_CHOICE + 1))
 echo -e "  ${CYAN}$SKIP_CHOICE)${NC} Skip for now"
 echo ""
 
@@ -1535,6 +1582,13 @@ case $choice in
         SIGNUP_URL="https://openrouter.ai/keys"
         ;;
     14)
+        SELECTED_ENV_VAR="DEEPSEEK_API_KEY"
+        SELECTED_PROVIDER_ID="deepseek"
+        SELECTED_API_BASE="https://api.deepseek.com"
+        PROVIDER_NAME="DeepSeek"
+        SIGNUP_URL="https://platform.deepseek.com/api_keys"
+        ;;
+    "$OLLAMA_CHOICE")
         # Local (Ollama) — no API key; pick model from ollama list
         if [ "$OLLAMA_DETECTED" != true ]; then
             echo ""
@@ -1771,6 +1825,165 @@ if [ -n "$SELECTED_PROVIDER_ID" ]; then
 fi
 
 echo ""
+
+# ============================================================
+# Vision Fallback (subagent for tool-result images)
+# ============================================================
+#
+# When a tool returns an image (browser_screenshot, render_image, etc.)
+# but the main agent's model is text-only, the framework can route the
+# image through a separate VLM subagent that returns a text caption,
+# preserving the agent's ability to reason about visual state.
+#
+# Skip entirely when the chosen main model already supports vision per
+# the catalog's ``supports_vision`` flag — the fallback would never fire
+# in that case, and prompting for it just adds friction. For text-only
+# mains we still offer the prompt so the user can wire up a captioning
+# subagent.
+
+MAIN_MODEL_HAS_VISION="false"
+if [ -n "$SELECTED_MODEL" ]; then
+    MAIN_MODEL_HAS_VISION=$(uv run python - "$SELECTED_MODEL" <<'PY' 2>/dev/null || echo "false"
+import sys
+from framework.llm.model_catalog import model_supports_vision
+print("true" if model_supports_vision(sys.argv[1]) else "false")
+PY
+)
+fi
+
+if [ -n "$SELECTED_PROVIDER_ID" ] && [ "$MAIN_MODEL_HAS_VISION" = "true" ]; then
+    # Drop any stale vision_fallback block so the config reflects the
+    # current main model's capabilities.
+    save_vision_fallback "" "" "" "" > /dev/null 2>&1 || true
+    echo -e "${GREEN}⬢${NC} Vision fallback ${DIM}skipped — ${SELECTED_MODEL} already supports vision${NC}"
+    echo ""
+elif [ -n "$SELECTED_PROVIDER_ID" ]; then
+    echo -e "${YELLOW}⬢${NC} ${BLUE}${BOLD}Vision fallback subagent${NC}"
+    echo ""
+    echo -e "  ${DIM}When a screenshot/image tool is called from a text-only model,${NC}"
+    echo -e "  ${DIM}the framework can route the image through a vision-capable VLM${NC}"
+    echo -e "  ${DIM}and inject the caption into the conversation. Inert when your${NC}"
+    echo -e "  ${DIM}main model already supports vision (most do).${NC}"
+    echo ""
+
+    # Build the candidate list from the same model_catalog.json the main
+    # LLM step uses — never hardcode model IDs in this script. For each
+    # provider in the catalogue, pick a model whose ``supports_vision``
+    # flag is true (since the fallback subagent's whole purpose is to
+    # caption images — a text-only candidate would be useless). Prefer
+    # the provider's default when it supports vision, otherwise fall
+    # back to the first vision-capable model in the provider's list.
+    # Skip the provider entirely if no model in its catalog supports
+    # vision. Output one TSV row per candidate:
+    # provider_id<TAB>model<TAB>env_var<TAB>display_name
+    VISION_CANDIDATES_TSV=$(uv run python - <<'PY'
+import os
+from framework.llm.model_catalog import get_default_models, get_models_catalogue
+
+# Map provider_id → the env-var name the framework reads its key from.
+# Mirrors PROVIDER_ENV_VARS at the top of quickstart.sh, plus how the
+# rest of the script picks an env var per provider.
+PROVIDER_KEY_ENV = {
+    "anthropic":  "ANTHROPIC_API_KEY",
+    "openai":     "OPENAI_API_KEY",
+    "gemini":     "GEMINI_API_KEY",
+    "groq":       "GROQ_API_KEY",
+    "cerebras":   "CEREBRAS_API_KEY",
+    "minimax":    "MINIMAX_API_KEY",
+    "mistral":    "MISTRAL_API_KEY",
+    "together":   "TOGETHER_API_KEY",
+    "deepseek":   "DEEPSEEK_API_KEY",
+    "kimi":       "KIMI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+}
+
+defaults = get_default_models()
+catalog  = get_models_catalogue()
+for provider_id, default_model in sorted(defaults.items()):
+    env = PROVIDER_KEY_ENV.get(provider_id)
+    if not env:
+        continue
+    # GEMINI_API_KEY OR GOOGLE_API_KEY both unlock gemini
+    has_key = bool(os.environ.get(env))
+    if provider_id == "gemini" and not has_key:
+        if os.environ.get("GOOGLE_API_KEY"):
+            has_key = True
+            env = "GOOGLE_API_KEY"
+    if not has_key:
+        continue
+    # Pick a vision-capable model: prefer the catalog default if it has
+    # supports_vision=true, else the first vision-capable model in the
+    # provider's list. Skip the provider if none exist.
+    models = catalog.get(provider_id, [])
+    chosen = None
+    for m in models:
+        if m["id"] == default_model and m.get("supports_vision") is True:
+            chosen = m["id"]
+            break
+    if chosen is None:
+        for m in models:
+            if m.get("supports_vision") is True:
+                chosen = m["id"]
+                break
+    if chosen is None:
+        continue
+    # Display name: provider/model from the catalogue verbatim
+    display = f"{provider_id}/{chosen}"
+    print(f"{provider_id}\t{chosen}\t{env}\t{display}")
+PY
+)
+
+    if [ -z "$VISION_CANDIDATES_TSV" ]; then
+        echo -e "  ${YELLOW}No matching API keys detected for any catalog provider.${NC}"
+        echo -e "  ${DIM}Set an API key for any provider in model_catalog.json and rerun.${NC}"
+        echo -e "  ${DIM}Skipping for now — text-only models will lose image content silently.${NC}"
+    else
+        # Materialise into bash array for selection
+        VISION_CANDIDATES=()
+        while IFS= read -r line; do
+            [ -n "$line" ] && VISION_CANDIDATES+=("$line")
+        done <<< "$VISION_CANDIDATES_TSV"
+
+        echo -e "  ${BOLD}Available vision-fallback models${NC} ${DIM}(from model_catalog.json):${NC}"
+        echo -e "    ${DIM}0)${NC} (skip — don't configure vision fallback)"
+        idx=1
+        for entry in "${VISION_CANDIDATES[@]}"; do
+            IFS=$'\t' read -r _vp _vm _vk _vd <<< "$entry"
+            echo -e "    ${DIM}${idx})${NC} ${_vd} ${DIM}[\$${_vk}]${NC}"
+            idx=$((idx + 1))
+        done
+        echo ""
+        VISION_CHOICE=""
+        while true; do
+            read -r -p "  Pick a vision-fallback model [1-${#VISION_CANDIDATES[@]}, 0=skip, default=1]: " VISION_CHOICE || VISION_CHOICE=""
+            VISION_CHOICE="${VISION_CHOICE:-1}"
+            if [[ "$VISION_CHOICE" =~ ^[0-9]+$ ]] && \
+               [ "$VISION_CHOICE" -ge 0 ] && \
+               [ "$VISION_CHOICE" -le "${#VISION_CANDIDATES[@]}" ]; then
+                break
+            fi
+            echo -e "  ${YELLOW}Please enter 0 (skip) or 1-${#VISION_CANDIDATES[@]}.${NC}"
+        done
+
+        if [ "$VISION_CHOICE" = "0" ]; then
+            # Explicit skip — drop any prior block so config stays clean.
+            save_vision_fallback "" "" "" "" > /dev/null 2>&1 || true
+            echo -e "  ${DIM}skipped — no vision_fallback block written${NC}"
+        else
+            chosen="${VISION_CANDIDATES[$((VISION_CHOICE - 1))]}"
+            IFS=$'\t' read -r vf_provider vf_model vf_env vf_display <<< "$chosen"
+            echo -n "  Saving vision_fallback... "
+            if save_vision_fallback "$vf_provider" "$vf_model" "$vf_env" "" > /dev/null; then
+                echo -e "${GREEN}⬢${NC}"
+                echo -e "  ${DIM}vision_fallback: ${vf_display} (key from \$${vf_env})${NC}"
+            else
+                echo -e "${RED}failed${NC}"
+                echo -e "  ${YELLOW}Could not write vision_fallback to ~/.hive/configuration.json — non-fatal, edit manually if needed.${NC}"
+            fi
+        fi
+    fi
+    echo ""
+fi
 
 # ============================================================
 # Browser Automation (GCU) — always enabled

@@ -1,5 +1,6 @@
 """aiohttp Application factory for the Hive HTTP API server."""
 
+import hmac
 import logging
 import os
 from pathlib import Path
@@ -21,7 +22,9 @@ _ALLOWED_AGENT_ROOTS: tuple[Path, ...] | None = None
 
 def _has_encrypted_credentials() -> bool:
     """Return True when an encrypted credential store already exists on disk."""
-    cred_dir = Path.home() / ".hive" / "credentials" / "credentials"
+    from framework.config import HIVE_HOME
+
+    cred_dir = HIVE_HOME / "credentials" / "credentials"
     return cred_dir.is_dir() and any(cred_dir.glob("*.enc"))
 
 
@@ -30,17 +33,18 @@ def _get_allowed_agent_roots() -> tuple[Path, ...]:
 
     Roots are anchored to the repository root (derived from ``__file__``)
     so the allowlist is correct regardless of the process's working
-    directory.
+    directory. The hive-home subtrees honour ``HIVE_HOME`` so the desktop's
+    per-user root is allowed in addition to (or instead of) ``~/.hive``.
     """
     global _ALLOWED_AGENT_ROOTS
     if _ALLOWED_AGENT_ROOTS is None:
-        from framework.config import COLONIES_DIR
+        from framework.config import COLONIES_DIR, HIVE_HOME
 
         _ALLOWED_AGENT_ROOTS = (
-            COLONIES_DIR.resolve(),  # ~/.hive/colonies/
+            COLONIES_DIR.resolve(),  # $HIVE_HOME/colonies/
             (_REPO_ROOT / "exports").resolve(),  # compat fallback
             (_REPO_ROOT / "examples").resolve(),
-            (Path.home() / ".hive" / "agents").resolve(),
+            (HIVE_HOME / "agents").resolve(),
         )
     return _ALLOWED_AGENT_ROOTS
 
@@ -62,7 +66,8 @@ def validate_agent_path(agent_path: str | Path) -> Path:
         if resolved.is_relative_to(root) and resolved != root:
             return resolved
     raise ValueError(
-        "agent_path must be inside an allowed directory (~/.hive/colonies/, exports/, examples/, or ~/.hive/agents/)"
+        "agent_path must be inside an allowed directory "
+        "($HIVE_HOME/colonies/, exports/, examples/, or $HIVE_HOME/agents/)"
     )
 
 
@@ -94,13 +99,15 @@ def resolve_session(request: web.Request):
 def sessions_dir(session: Session) -> Path:
     """Resolve the worker sessions directory for a session.
 
-    Storage layout: ~/.hive/agents/{agent_name}/sessions/
+    Storage layout: $HIVE_HOME/agents/{agent_name}/sessions/
     Requires a worker to be loaded (worker_path must be set).
     """
     if session.worker_path is None:
         raise ValueError("No worker loaded — no worker sessions directory")
+    from framework.config import HIVE_HOME
+
     agent_name = session.worker_path.name
-    return Path.home() / ".hive" / "agents" / agent_name / "sessions"
+    return HIVE_HOME / "agents" / agent_name / "sessions"
 
 
 # Allowed CORS origins (localhost on any port)
@@ -157,6 +164,28 @@ async def no_cache_api_middleware(request: web.Request, handler):
     if request.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"
     return response
+
+
+# ---------------------------------------------------------------------------
+# Desktop shared-secret auth middleware.
+#
+# When the runtime is spawned by the Electron main process, a fresh random
+# token is passed via ``HIVE_DESKTOP_TOKEN``. Every request from main must
+# carry the matching ``X-Hive-Token`` header. If the env var is unset (e.g.
+# running ``hive serve`` directly from a terminal), the check is skipped —
+# OSS behaviour is preserved.
+# ---------------------------------------------------------------------------
+_EXPECTED_DESKTOP_TOKEN: str | None = os.environ.get("HIVE_DESKTOP_TOKEN") or None
+
+
+@web.middleware
+async def desktop_auth_middleware(request: web.Request, handler):
+    if _EXPECTED_DESKTOP_TOKEN is None:
+        return await handler(request)
+    provided = request.headers.get("X-Hive-Token", "")
+    if not hmac.compare_digest(provided, _EXPECTED_DESKTOP_TOKEN):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    return await handler(request)
 
 
 @web.middleware
@@ -287,7 +316,12 @@ def create_app(model: str | None = None) -> web.Application:
     Returns:
         Configured aiohttp Application ready to run.
     """
-    app = web.Application(middlewares=[cors_middleware, no_cache_api_middleware, error_middleware])
+    # Desktop mode: the runtime is always a subprocess of the Electron main
+    # process, which reaches it via IPC and the `hive://` custom protocol.
+    # There is no browser origin to authorize, so CORS is unnecessary.
+    # The auth middleware enforces the shared-secret token when the env var
+    # is set (i.e. when Electron spawned us); it is a no-op otherwise.
+    app = web.Application(middlewares=[desktop_auth_middleware, no_cache_api_middleware, error_middleware])
 
     # Initialize credential store (before SessionManager so it can be shared)
     from framework.credentials.store import CredentialStore
@@ -335,6 +369,18 @@ def create_app(model: str | None = None) -> web.Application:
         queen_tool_registry=None,
     )
 
+    # Clear orphaned compaction markers from prior server crashes. Without
+    # this, any session whose compaction was interrupted would block the
+    # next colony cold-load for the full await_completion timeout (180s)
+    # before falling through. See compaction_status.sweep_stale_in_progress.
+    try:
+        from framework.config import QUEENS_DIR
+        from framework.server import compaction_status
+
+        compaction_status.sweep_stale_in_progress(QUEENS_DIR)
+    except Exception:
+        logger.debug("compaction_status: startup sweep skipped", exc_info=True)
+
     # Register shutdown hook
     app.on_shutdown.append(_on_shutdown)
 
@@ -344,6 +390,7 @@ def create_app(model: str | None = None) -> web.Application:
     app.router.add_get("/api/browser/status/stream", handle_browser_status_stream)
 
     # Register route modules
+    from framework.server.routes_colonies import register_routes as register_colonies_routes
     from framework.server.routes_colony_tools import register_routes as register_colony_tools_routes
     from framework.server.routes_colony_workers import register_routes as register_colony_worker_routes
     from framework.server.routes_config import register_routes as register_config_routes
@@ -358,6 +405,7 @@ def create_app(model: str | None = None) -> web.Application:
     from framework.server.routes_queens import register_routes as register_queen_routes
     from framework.server.routes_sessions import register_routes as register_session_routes
     from framework.server.routes_skills import register_routes as register_skills_routes
+    from framework.server.routes_tasks import register_routes as register_task_routes
     from framework.server.routes_workers import register_routes as register_worker_routes
 
     register_config_routes(app)
@@ -370,14 +418,31 @@ def create_app(model: str | None = None) -> web.Application:
     register_log_routes(app)
     register_queen_routes(app)
     register_queen_tools_routes(app)
+    register_colonies_routes(app)
     register_colony_tools_routes(app)
     register_mcp_routes(app)
     register_colony_worker_routes(app)
     register_prompt_routes(app)
     register_skills_routes(app)
+    register_task_routes(app)
 
-    # Static file serving — Option C production mode
-    # If frontend/dist/ exists, serve built frontend files on /
+    # Commercial extensions (optional — only present in hive-desktop-runtime).
+    # Imports lazily so an OSS install without the `commercial` package keeps
+    # working unchanged.
+    try:
+        from commercial.middleware import setup_commercial_middleware
+        from commercial.routes import register_routes as register_commercial_routes
+
+        setup_commercial_middleware(app)
+        register_commercial_routes(app)
+        logger.info("Commercial extensions loaded")
+    except ImportError:
+        pass
+
+    # Serve the built frontend SPA (if frontend/dist exists) so hitting the
+    # API host in a browser loads the dashboard instead of 404'ing. In
+    # Electron/desktop mode the renderer still loads from file:// and
+    # ignores this; in dev mode Vite is used instead.
     _setup_static_serving(app)
 
     return app

@@ -714,7 +714,7 @@ class CredentialStore:
     @classmethod
     def with_aden_sync(
         cls,
-        base_url: str = "https://api.adenhq.com",
+        base_url: str | None = None,
         cache_ttl_seconds: int = 300,
         local_path: str | None = None,
         auto_sync: bool = True,
@@ -745,13 +745,14 @@ class CredentialStore:
             token = store.get_key("hubspot", "access_token")
         """
         import os
-        from pathlib import Path
 
         from .storage import EncryptedFileStorage
 
         # Determine local storage path
         if local_path is None:
-            local_path = str(Path.home() / ".hive" / "credentials")
+            from framework.config import HIVE_HOME
+
+            local_path = str(HIVE_HOME / "credentials")
 
         local_storage = EncryptedFileStorage(base_path=local_path)
 
@@ -760,6 +761,14 @@ class CredentialStore:
         if not api_key:
             logger.info("ADEN_API_KEY not set, using local-only credential storage")
             return cls(storage=local_storage, **kwargs)
+
+        # Honor ADEN_API_URL when no explicit base_url was passed. The
+        # legacy default (https://api.adenhq.com) was a stale brand
+        # alias; the new canonical host is app.open-hive.com (matches
+        # cloud-deployed hive-backend) but local dev typically points
+        # at http://localhost:8889 via this env var.
+        if base_url is None:
+            base_url = os.environ.get("ADEN_API_URL", "https://app.open-hive.com")
 
         # Try to setup Aden sync
         try:

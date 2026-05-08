@@ -140,9 +140,47 @@ export function sseEventToChatMessage(
       };
     }
 
-    case "client_input_requested":
-      // Handled explicitly in handleSSEEvent (workspace.tsx) for queen input widgets.
-      return null;
+    case "client_input_requested": {
+      // Surface the question(s) as a queen bubble in the chat history so the
+      // transcript records what was asked alongside the user's answer. The
+      // input widget at the bottom of the panel still drives the actual
+      // answer flow — this bubble is read-only context.
+      const rawQuestions = event.data?.questions;
+      if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) return null;
+      const prompts: string[] = [];
+      for (const q of rawQuestions) {
+        if (!q || typeof q !== "object") continue;
+        const qo = q as Record<string, unknown>;
+        const prompt =
+          typeof qo.prompt === "string"
+            ? qo.prompt
+            : typeof qo.question === "string"
+              ? (qo.question as string)
+              : null;
+        if (prompt) prompts.push(prompt);
+      }
+      if (prompts.length === 0) return null;
+      const content =
+        prompts.length === 1
+          ? prompts[0]
+          : prompts.map((p, i) => `${i + 1}. ${p}`).join("\n");
+      return {
+        // Stable per-request id so live + replay paths upsert the same row.
+        id: `ask-user-${event.execution_id ?? ""}-${event.timestamp ?? createdAt}`,
+        agent: agentDisplayName || event.node_id || "Agent",
+        agentColor: "",
+        content,
+        timestamp: "",
+        // Default to worker; the replayEvent wrapper upgrades to "queen"
+        // when stream_id === "queen". Mirrors llm_text_delta's pattern.
+        role: "worker",
+        thread,
+        createdAt,
+        nodeId: event.node_id || undefined,
+        executionId: event.execution_id || undefined,
+        streamId: event.stream_id || undefined,
+      };
+    }
 
     case "client_input_received": {
       const userContent = (event.data?.content as string) || "";
@@ -257,11 +295,39 @@ export function sseEventToChatMessage(
  * deferred `tool_call_completed` events can find the exact pill they belong
  * to after the turn counter moves on.
  */
+/**
+ * For chart_* tools we retain the args (from tool_call_started) and
+ * result envelope (from tool_call_completed) so the chat panel can
+ * render the live chart inline from the same spec the runtime
+ * rasterized to PNG. Other tools omit these fields to keep the
+ * tool_status content payload small (catalogs are pill-only).
+ */
+type ToolEntry = {
+  name: string;
+  done: boolean;
+  /** opaque per-call id surfaced to the UI; used to key React rows */
+  callKey?: string;
+  /** present only for tools whose name matches shouldRetainDetail */
+  args?: unknown;
+  result?: unknown;
+  isError?: boolean;
+};
+
 type ToolRowState = {
   streamId: string;
   executionId: string;
-  tools: Record<string, { name: string; done: boolean }>;
+  tools: Record<string, ToolEntry>;
 };
+
+/**
+ * Names whose detail (args + result envelope) we surface in the chat.
+ * Other tools stay pill-only — keeping their args/results out of the
+ * message content avoids ballooning the chat history with tool
+ * catalogs, file blobs, etc.
+ */
+function shouldRetainDetail(toolName: string): boolean {
+  return toolName.startsWith("chart_");
+}
 
 export interface ReplayState {
   turnCounters: Record<string, number>;
@@ -282,6 +348,26 @@ export function newReplayState(): ReplayState {
   };
 }
 
+/**
+ * Token / cost accumulator for cold-restore.
+ *
+ * Folded into ``replayEventsToMessages`` so callers don't need a second
+ * pass over the event array just to sum ``llm_turn_complete`` payloads.
+ * The accumulator object is mutated in place — pass a fresh one in,
+ * read its fields out after the call.
+ */
+export interface TokenAccumulator {
+  input: number;
+  output: number;
+  cached: number;
+  cacheCreated: number;
+  costUsd: number;
+}
+
+export function newTokenAccumulator(): TokenAccumulator {
+  return { input: 0, output: 0, cached: 0, cacheCreated: 0, costUsd: 0 };
+}
+
 function toolLookupKey(
   streamId: string,
   executionId: string | null | undefined,
@@ -291,10 +377,20 @@ function toolLookupKey(
 }
 
 function toolRowContent(row: ToolRowState): string {
-  const tools = Object.values(row.tools).map((t) => ({
-    name: t.name,
-    done: t.done,
-  }));
+  const tools = Object.values(row.tools).map((t) => {
+    const out: ToolEntry = { name: t.name, done: t.done };
+    // Carry callKey + retained fields only for tools whose detail the
+    // UI mounts (chart_*). Pill-only tools stay terse so the
+    // tool_status payload doesn't grow with every catalog/file_ops
+    // call and existing snapshot tests stay valid.
+    if (shouldRetainDetail(t.name)) {
+      if (t.callKey !== undefined) out.callKey = t.callKey;
+      if (t.args !== undefined) out.args = t.args;
+      if (t.result !== undefined) out.result = t.result;
+      if (t.isError !== undefined) out.isError = t.isError;
+    }
+    return out;
+  });
   const allDone = tools.length > 0 && tools.every((t) => t.done);
   return JSON.stringify({ tools, allDone });
 }
@@ -359,10 +455,19 @@ export function replayEvent(
           tools: {},
         });
       const toolKey = toolUseId || `anonymous-${Object.keys(row.tools).length}`;
-      row.tools[toolKey] = {
+      const entry: ToolEntry = {
         name: toolName,
         done: false,
+        callKey: toolKey,
       };
+      // Capture args at start for retained-detail tools so the chat
+      // can show what the agent rendered. Other tools' arguments are
+      // intentionally dropped to keep the tool_status JSON small.
+      if (shouldRetainDetail(toolName)) {
+        const toolInput = event.data?.tool_input;
+        if (toolInput !== undefined) entry.args = toolInput;
+      }
+      row.tools[toolKey] = entry;
       if (toolUseId) {
         state.toolUseToPill[toolLookupKey(streamId, event.execution_id, toolUseId)] = {
           msgId: pillId,
@@ -395,10 +500,38 @@ export function replayEvent(
       if (!tracked) break;
       const row = state.toolRows[tracked.msgId];
       if (!row) break;
-      row.tools[tracked.toolKey] = {
-        name: row.tools[tracked.toolKey]?.name || tracked.name,
+      const prior = row.tools[tracked.toolKey];
+      const completedName = prior?.name || tracked.name;
+      const completed: ToolEntry = {
+        name: completedName,
         done: true,
+        callKey: tracked.toolKey,
       };
+      // Preserve any args captured at start; capture the result
+      // envelope for retained-detail tools (chart_* needs spec/file_url
+      // to mount the live chart).
+      if (shouldRetainDetail(completedName)) {
+        if (prior?.args !== undefined) completed.args = prior.args;
+        const rawResult = event.data?.result;
+        if (rawResult !== undefined) {
+          // The framework serializes envelopes as JSON strings. Try to
+          // parse so the renderer can pick fields cheaply; fall back to
+          // the raw value when parsing fails (already-an-object or
+          // non-JSON string).
+          if (typeof rawResult === "string") {
+            try {
+              completed.result = JSON.parse(rawResult);
+            } catch {
+              completed.result = rawResult;
+            }
+          } else {
+            completed.result = rawResult;
+          }
+        }
+        const isErr = event.data?.is_error;
+        if (typeof isErr === "boolean") completed.isError = isErr;
+      }
+      row.tools[tracked.toolKey] = completed;
       out.push({
         id: tracked.msgId,
         agent: effectiveName || event.node_id || "Agent",
@@ -470,6 +603,7 @@ export function replayEventsToMessages(
   agentDisplayName: string | undefined,
   queenDisplayName?: string,
   state: ReplayState = newReplayState(),
+  tokenAccumulator?: TokenAccumulator,
 ): ChatMessage[] {
   // Upsert by id — later emissions for the same pill replace earlier ones.
   const byId = new Map<string, ChatMessage>();
@@ -482,6 +616,18 @@ export function replayEventsToMessages(
   const inheritedIds = new Set<string>();
 
   for (const evt of events) {
+    // Fold the token-usage sum into this same loop so cold-restore
+    // doesn't need a second pass over the event array. SSE does not
+    // replay llm_turn_complete (see routes_events.py _REPLAY_TYPES) so
+    // there's no double-count risk against later live updates.
+    if (tokenAccumulator && evt.type === "llm_turn_complete" && evt.data) {
+      const d = evt.data as Record<string, unknown>;
+      tokenAccumulator.input += (d.input_tokens as number) || 0;
+      tokenAccumulator.output += (d.output_tokens as number) || 0;
+      tokenAccumulator.cached += (d.cached_tokens as number) || 0;
+      tokenAccumulator.cacheCreated += (d.cache_creation_tokens as number) || 0;
+      tokenAccumulator.costUsd += (d.cost_usd as number) || 0;
+    }
     if (evt.type === "colony_fork_marker") {
       if (markerEvent === null) {
         markerEvent = evt;

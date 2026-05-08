@@ -26,11 +26,15 @@ class SkillRegistryStage(PipelineStage):
         project_root: str | Path | None = None,
         interactive: bool = True,
         skills_config: Any = None,
+        extra_scope_dirs: list[Any] | None = None,
         **kwargs: Any,
     ) -> None:
         self._project_root = Path(project_root) if project_root else None
         self._interactive = interactive
         self._skills_config = skills_config
+        # Optional list of ExtraScope entries layered between user and
+        # project scope (e.g. ``colony_ui`` for a colony agent's skills/).
+        self._extra_scope_dirs = list(extra_scope_dirs) if extra_scope_dirs else []
         self.skills_manager: Any = None
 
     async def initialize(self) -> None:
@@ -41,6 +45,7 @@ class SkillRegistryStage(PipelineStage):
             skills_config=self._skills_config or SkillsConfig(),
             project_root=self._project_root,
             interactive=self._interactive,
+            extra_scope_dirs=self._extra_scope_dirs,
         )
         self.skills_manager = SkillsManager(config)
         self.skills_manager.load()

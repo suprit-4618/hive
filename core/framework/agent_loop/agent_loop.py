@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import time
 import uuid
@@ -85,7 +84,12 @@ from framework.agent_loop.internals.types import (
     JudgeVerdict,
     TriggerEvent,
 )
+from framework.agent_loop.internals.vision_fallback import (
+    caption_tool_image,
+    extract_intent_for_tool,
+)
 from framework.agent_loop.types import AgentContext, AgentProtocol, AgentResult
+from framework.config import get_vision_fallback_model
 from framework.host.event_bus import EventBus
 from framework.llm.capabilities import filter_tools_for_model, supports_image_tool_results
 from framework.llm.provider import Tool, ToolResult, ToolUse
@@ -177,46 +181,58 @@ def _strip_internal_tags_from_snapshot(snapshot: str) -> str:
     return cleaned
 
 
-async def _describe_images_as_text(image_content: list[dict[str, Any]]) -> str | None:
-    """Describe images using the best available vision model."""
-    import litellm
+def _vision_fallback_active(model: str | None) -> bool:
+    """Return True if tool-result images for *model* should be routed
+    through the vision-fallback chain rather than sent to the model.
 
-    blocks: list[dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": (
-                "Describe the following image(s) concisely but with enough detail "
-                "that a text-only AI assistant can understand the content and context."
-            ),
-        }
-    ]
-    blocks.extend(image_content)
+    Trigger: the model's catalog entry has ``supports_vision: false``
+    (resolved via :func:`capabilities.supports_image_tool_results`,
+    which reads ``model_catalog.json``). Unknown models default to
+    vision-capable, so the fallback only fires when the catalog
+    explicitly says the model is text-only.
 
-    candidates: list[str] = []
-    if os.environ.get("OPENAI_API_KEY"):
-        candidates.append("gpt-4o-mini")
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        candidates.append("claude-3-haiku-20240307")
-    if os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"):
-        candidates.append("gemini/gemini-1.5-flash")
+    The ``vision_fallback`` config block is the *substitution* model —
+    it doesn't widen the trigger. To force fallback for a model that
+    isn't catalogued yet, add an entry to ``model_catalog.json`` with
+    ``supports_vision: false`` rather than relying on a runtime config.
+    """
+    if not model:
+        return False
+    return not supports_image_tool_results(model)
 
-    for model in candidates:
-        try:
-            response = await litellm.acompletion(
-                model=model,
-                messages=[{"role": "user", "content": blocks}],
-                max_tokens=512,
-            )
-            description = (response.choices[0].message.content or "").strip()
-            if description:
-                count = len(image_content)
-                label = "image" if count == 1 else f"{count} images"
-                return f"[{label} attached  — description: {description}]"
-        except Exception as exc:
-            logger.debug("Vision fallback model '%s' failed: %s", model, exc)
-            continue
 
-    return None
+async def _captioning_chain(
+    intent: str,
+    image_content: list[dict[str, Any]],
+) -> tuple[str, str] | None:
+    """Configured vision_fallback → retry → ``gemini/gemini-3-flash-preview``.
+
+    The Gemini override reuses the configured ``api_key`` / ``api_base``,
+    so a Hive subscriber (whose token routes to a multi-model proxy)
+    keeps coverage when their primary model glitches. Without
+    configured creds litellm falls through to env-based Gemini auth;
+    users with neither Hive nor a ``GEMINI_API_KEY`` simply lose the
+    third try.
+    """
+    if result := await caption_tool_image(intent, image_content):
+        return result
+    logger.warning("vision_fallback failed; retrying configured model")
+    if result := await caption_tool_image(intent, image_content):
+        return result
+    # Match the configured model's proxy prefix so the override is routed
+    # through the same endpoint with the same auth shape. Without this,
+    # a Hive subscriber's `hive/...` config would override to
+    # `gemini/...` — which sends Google's Gemini protocol to the
+    # Anthropic-compatible Hive proxy (404), not what we want.
+    configured = (get_vision_fallback_model() or "").lower()
+    if configured.startswith("hive/"):
+        override = "hive/gemini-3-flash-preview"
+    elif configured.startswith("kimi/"):
+        override = "kimi/gemini-3-flash-preview"
+    else:
+        override = "gemini/gemini-3-flash-preview"
+    logger.warning("vision_fallback retry failed; trying %s", override)
+    return await caption_tool_image(intent, image_content, model_override=override)
 
 
 # Pattern for detecting context-window-exceeded errors across LLM providers.
@@ -375,6 +391,14 @@ class AgentLoop(AgentProtocol):
         # without waiting for execute() to return. Keys are stable so
         # dashboards can build aggregates over many runs.
         self._counters: dict[str, int] = {}
+
+        # Task-system reminder state (see framework/tasks/reminders.py).
+        # Bumped each iteration; reset whenever a task op tool was called
+        # in the iteration that just completed; nudges the agent via the
+        # injection queue when it's been silent on tasks for too long.
+        from framework.tasks.reminders import ReminderState as _RS
+
+        self._task_reminder_state: _RS = _RS()
 
     def _bump(self, key: str, by: int = 1) -> None:
         """Increment a reliability counter (creates the key on first use)."""
@@ -575,6 +599,7 @@ class AgentLoop(AgentProtocol):
                 store=self._conversation_store,
                 run_id=ctx.effective_run_id,
                 compaction_buffer_tokens=self._config.compaction_buffer_tokens,
+                compaction_buffer_ratio=self._config.compaction_buffer_ratio,
                 compaction_warning_buffer_tokens=(self._config.compaction_warning_buffer_tokens),
             )
             accumulator = OutputAccumulator(
@@ -625,8 +650,23 @@ class AgentLoop(AgentProtocol):
         # Hide image-producing tools from text-only models so they never try
         # to call them. Avoids wasted turns + "screenshot failed" lessons
         # getting saved to memory. See framework.llm.capabilities.
+        # EXCEPTION: when the model IS on the text-only deny list AND
+        # a vision_fallback subagent is configured, leave image tools
+        # visible. The post-execution hook in the inner tool loop
+        # will route each image_content through the fallback VLM and
+        # replace it with a text caption before the main agent sees
+        # the result — so the main agent gets captions instead of
+        # raw images, rather than losing the tool entirely. We DON'T
+        # bypass the filter for vision-capable models (that would be
+        # a no-op anyway — the filter doesn't fire for them) and we
+        # DON'T bypass it without a configured fallback (the agent
+        # would just see raw stripped tool results with no caption).
         _llm_model = ctx.llm.model if ctx.llm else ""
-        tools, _hidden_image_tools = filter_tools_for_model(tools, _llm_model)
+        _text_only_main = _llm_model and not supports_image_tool_results(_llm_model)
+        if _text_only_main and get_vision_fallback_model() is not None:
+            _hidden_image_tools: list[str] = []
+        else:
+            tools, _hidden_image_tools = filter_tools_for_model(tools, _llm_model)
 
         logger.info(
             "[%s] Tools available (%d): %s | direct_user_io=%s | judge=%s | hidden_image_tools=%s",
@@ -930,6 +970,17 @@ class AgentLoop(AgentProtocol):
                     )
                     total_input_tokens += turn_tokens.get("input", 0)
                     total_output_tokens += turn_tokens.get("output", 0)
+
+                    # Task-system reminder: if the model has been silent on
+                    # task ops for too long but still has open tasks, drop
+                    # a steering reminder onto the injection queue. Drained
+                    # at the next iteration's 6b so it lands as the next
+                    # user turn via the normal injection path. Best-effort
+                    # — never raises.
+                    try:
+                        await self._maybe_inject_task_reminder(ctx, logged_tool_calls)
+                    except Exception:
+                        logger.debug("task reminder check failed", exc_info=True)
                     await self._publish_llm_turn_complete(
                         stream_id,
                         node_id,
@@ -938,6 +989,8 @@ class AgentLoop(AgentProtocol):
                         input_tokens=turn_tokens.get("input", 0),
                         output_tokens=turn_tokens.get("output", 0),
                         cached_tokens=turn_tokens.get("cached", 0),
+                        cache_creation_tokens=turn_tokens.get("cache_creation", 0),
+                        cost_usd=float(turn_tokens.get("cost", 0.0) or 0.0),
                         execution_id=execution_id,
                         iteration=iteration,
                     )
@@ -952,6 +1005,7 @@ class AgentLoop(AgentProtocol):
                         tool_calls=logged_tool_calls,
                         tool_results=real_tool_results,
                         token_counts=turn_tokens,
+                        tools=tools,
                     )
 
                     # DS-13: inject context preservation warning once when token usage
@@ -2338,7 +2392,9 @@ class AgentLoop(AgentProtocol):
         stream_id = ctx.stream_id or ctx.agent_id
         node_id = ctx.agent_id
         execution_id = ctx.execution_id or ""
-        token_counts: dict[str, int] = {"input": 0, "output": 0, "cached": 0}
+        # Mixed-type dict: int token counts + str stop_reason/model + float cost.
+        # Typed loosely to avoid churn in the many call sites that read from it.
+        token_counts: dict[str, Any] = {"input": 0, "output": 0, "cached": 0, "cache_creation": 0, "cost": 0.0}
         tool_call_count = 0
         final_text = ""
         final_system_prompt = conversation.system_prompt
@@ -2569,6 +2625,8 @@ class AgentLoop(AgentProtocol):
                         token_counts["input"] += event.input_tokens
                         token_counts["output"] += event.output_tokens
                         token_counts["cached"] += event.cached_tokens
+                        token_counts["cache_creation"] += event.cache_creation_tokens
+                        token_counts["cost"] = token_counts.get("cost", 0.0) + event.cost_usd
                         token_counts["stop_reason"] = event.stop_reason
                         token_counts["model"] = event.model
 
@@ -3361,6 +3419,30 @@ class AgentLoop(AgentProtocol):
 
             # Phase 3: record results into conversation in original order,
             # build logged/real lists, and publish completed events.
+            #
+            # Vision-fallback prefetch: a single turn may fire several
+            # image-producing tools in parallel (e.g. one screenshot
+            # per tab). Captioning each one takes a vision LLM round
+            # trip (1–30 s). Doing them sequentially in this loop
+            # would serialise that latency per image. Instead, kick
+            # off all caption tasks concurrently NOW, and await each
+            # one just-in-time inside the per-tc body. If only a
+            # single image needs captioning, this collapses to a
+            # single await with no overhead.
+            _model_text_only = ctx.llm and _vision_fallback_active(ctx.llm.model)
+            caption_tasks: dict[str, asyncio.Task[tuple[str, str] | None]] = {}
+            if _model_text_only:
+                for tc in tool_calls[:executed_in_batch]:
+                    res = results_by_id.get(tc.tool_use_id)
+                    if not res or not res.image_content:
+                        continue
+                    intent = extract_intent_for_tool(
+                        conversation,
+                        tc.tool_name,
+                        tc.tool_input or {},
+                    )
+                    caption_tasks[tc.tool_use_id] = asyncio.create_task(_captioning_chain(intent, res.image_content))
+
             for tc in tool_calls[:executed_in_batch]:
                 result = results_by_id.get(tc.tool_use_id)
                 if result is None:
@@ -3383,11 +3465,33 @@ class AgentLoop(AgentProtocol):
                     logged_tool_calls.append(tool_entry)
 
                 image_content = result.image_content
-                if image_content and ctx.llm and not supports_image_tool_results(ctx.llm.model):
-                    logger.info(
-                        "Stripping image_content from tool result; model '%s' does not support images in tool results",
-                        ctx.llm.model,
-                    )
+                # Vision-fallback marker spliced into the persisted text
+                # below. None when no captioning ran (vision-capable
+                # main model, no images, or no fallback chain reached
+                # this tool).
+                vision_fallback_marker: str | None = None
+                if image_content and tc.tool_use_id in caption_tasks:
+                    caption_result = await caption_tasks.pop(tc.tool_use_id)
+                    if caption_result:
+                        caption, vision_model = caption_result
+                        vision_fallback_marker = f"[vision-fallback caption]\n{caption}"
+                        logger.info(
+                            "vision_fallback: captioned %d image(s) for tool '%s' "
+                            "(main model '%s' routed through fallback model '%s')",
+                            len(image_content),
+                            tc.tool_name,
+                            ctx.llm.model if ctx.llm else "?",
+                            vision_model,
+                        )
+                    else:
+                        vision_fallback_marker = "[image stripped — vision fallback exhausted]"
+                        logger.info(
+                            "vision_fallback: exhausted; stripping %d image(s) from "
+                            "tool '%s' result without caption (model '%s')",
+                            len(image_content),
+                            tc.tool_name,
+                            ctx.llm.model if ctx.llm else "?",
+                        )
                     image_content = None
 
                 # Apply replay-detector steer prefix if this call matched a
@@ -3398,6 +3502,11 @@ class AgentLoop(AgentProtocol):
                     _prefix = replay_prefixes_by_id.get(tc.tool_use_id)
                     if _prefix:
                         stored_content = f"{_prefix}{stored_content or ''}"
+
+                # Splice the vision-fallback caption / placeholder into
+                # the persisted text after any prefix has been applied.
+                if vision_fallback_marker:
+                    stored_content = f"{stored_content or ''}\n\n{vision_fallback_marker}"
 
                 await conversation.add_tool_result(
                     tool_use_id=tc.tool_use_id,
@@ -4025,7 +4134,7 @@ class AgentLoop(AgentProtocol):
             queue=self._injection_queue,
             conversation=conversation,
             ctx=ctx,
-            describe_images_as_text_fn=_describe_images_as_text,
+            caption_image_fn=_captioning_chain,
         )
 
     async def _drain_trigger_queue(self, conversation: NodeConversation) -> int:
@@ -4089,6 +4198,74 @@ class AgentLoop(AgentProtocol):
             execution_id=execution_id,
         )
 
+    async def _maybe_inject_task_reminder(
+        self,
+        ctx: AgentContext,
+        logged_tool_calls: list[dict[str, Any]] | None,
+    ) -> None:
+        """Layer 3 task-system steering — periodic reminder injection.
+
+        Called once per iteration after the LLM turn completes. If the
+        model has been silent on task ops for a while AND there are open
+        tasks on its session list, queue a system-style reminder onto
+        the injection queue so the next iteration drains it as a user
+        turn. Idempotent / safe to call always — gates internally.
+
+        ``logged_tool_calls`` is a list of dicts with at least a "name"
+        key, as accumulated by ``_run_single_turn``. Names like
+        ``task_create``, ``task_update``, ``colony_template_*`` reset
+        the counter (see ``framework.tasks.reminders.TASK_OP_TOOL_NAMES``).
+        """
+        from framework.tasks import get_task_store
+        from framework.tasks.models import TaskStatus
+        from framework.tasks.reminders import build_reminder, saw_task_op
+
+        state = self._task_reminder_state
+
+        # 1. Update counters based on this turn's tool calls.
+        names: list[str] = []
+        for call in logged_tool_calls or []:
+            try:
+                name = call.get("name") or call.get("tool_name")
+                if name:
+                    names.append(name)
+            except (AttributeError, TypeError):
+                continue
+        if saw_task_op(names):
+            state.on_task_op()
+        state.on_iteration()
+
+        # 2. Resolve the agent's task list. Skip if context isn't wired yet.
+        list_id = getattr(ctx, "task_list_id", None)
+        if not list_id:
+            return
+
+        # 3. Read the open-task snapshot. Best-effort.
+        try:
+            store = get_task_store()
+            records = await store.list_tasks(list_id)
+        except Exception:
+            return
+        open_tasks = [r for r in records if r.status != TaskStatus.COMPLETED]
+        if not state.should_remind(bool(open_tasks)):
+            return
+
+        body = build_reminder(records)
+        if not body:
+            return
+
+        # 4. Enqueue. Drained at the next iteration's 6b drain step and
+        # rendered as a user turn (with the "[External event]" prefix).
+        await self._injection_queue.put((body, False, None))
+        state.on_reminder_sent()
+        logger.info(
+            "[task-reminder] queued nudge for %s (open=%d, silent_turns=%d)",
+            list_id,
+            len(open_tasks),
+            state.turns_since_task_op,
+        )
+        self._bump("task_reminders_sent")
+
     async def _run_hooks(
         self,
         event: str,
@@ -4150,6 +4327,8 @@ class AgentLoop(AgentProtocol):
         input_tokens: int,
         output_tokens: int,
         cached_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+        cost_usd: float = 0.0,
         execution_id: str = "",
         iteration: int | None = None,
     ) -> None:
@@ -4162,6 +4341,8 @@ class AgentLoop(AgentProtocol):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+            cost_usd=cost_usd,
             execution_id=execution_id,
             iteration=iteration,
         )

@@ -51,6 +51,14 @@ _DEFAULT_LOCAL_SERVERS: dict[str, dict[str, Any]] = {
         "description": "File I/O: read, write, edit, search, list, run commands",
         "args": ["run", "python", "files_server.py", "--stdio"],
     },
+    "terminal-tools": {
+        "description": "Terminal capabilities",
+        "args": ["run", "python", "terminal_tools_server.py", "--stdio"],
+    },
+    "chart-tools": {
+        "description": "BI/financial chart + diagram rendering: ECharts, Mermaid",
+        "args": ["run", "python", "chart_tools_server.py", "--stdio"],
+    },
 }
 
 # Aliases that earlier versions of ensure_defaults wrote under the wrong name.
@@ -58,14 +66,22 @@ _DEFAULT_LOCAL_SERVERS: dict[str, dict[str, Any]] = {
 # name so the active agents (queen, credential_tester) can find their tools.
 _STALE_DEFAULT_ALIASES: dict[str, str] = {
     "hive_tools": "hive-tools",
+    # 2026-04-30: shell-tools renamed to terminal-tools. Drop the stale name
+    # on next ensure_defaults() so the queen's allowlist (which now includes
+    # @server:terminal-tools) actually finds a server with the new name.
+    "terminal-tools": "shell-tools",
 }
 
 
 class MCPRegistry:
-    """Manages local MCP server state in ~/.hive/mcp_registry/."""
+    """Manages local MCP server state in $HIVE_HOME/mcp_registry/."""
 
     def __init__(self, base_path: Path | None = None):
-        self._base = base_path or Path.home() / ".hive" / "mcp_registry"
+        if base_path is None:
+            from framework.config import HIVE_HOME
+
+            base_path = HIVE_HOME / "mcp_registry"
+        self._base = base_path
         self._installed_path = self._base / "installed.json"
         self._config_path = self._base / "config.json"
         self._cache_dir = self._base / "cache"
@@ -73,7 +89,30 @@ class MCPRegistry:
     # ── Initialization ──────────────────────────────────────────────
 
     def initialize(self) -> None:
-        """Create directory structure and default files if missing."""
+        """Create directory structure, default files, and seed bundled servers.
+
+        Every read path (queen orchestrator, pipeline stage, CLI, routes)
+        calls this — keeping the seeding here means a fresh ``HIVE_HOME``
+        (e.g. the desktop's per-user dir under ``~/.config/Hive/users/<hash>/``
+        or ``~/Library/Application Support/Hive/users/<hash>/``) is always
+        populated with ``hive_tools`` / ``gcu-tools`` / ``files-tools`` /
+        ``shell-tools`` before any agent code reads ``installed.json``.
+        Without this, ``load_agent_selection()`` resolves an empty registry
+        and emits "Server X requested but not installed" warnings even
+        though the server is bundled.
+
+        Idempotent — already-installed entries are left untouched.
+        """
+        self._bootstrap_io()
+        self._seed_defaults()
+
+    def _bootstrap_io(self) -> None:
+        """Create the registry directory + empty config/installed files.
+
+        Split out from ``initialize()`` so ``_seed_defaults()`` can call it
+        without re-entering the seeding logic (which would recurse via
+        ``_read_installed()`` → ``initialize()``).
+        """
         self._base.mkdir(parents=True, exist_ok=True)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -84,21 +123,33 @@ class MCPRegistry:
             self._write_json(self._installed_path, {"servers": {}})
 
     def ensure_defaults(self) -> list[str]:
-        """Seed the built-in local MCP servers (hive-tools, gcu-tools, files-tools).
+        """Public alias kept for the ``hive mcp init`` CLI command.
 
-        Idempotent — servers already present are left untouched. Skips seeding
-        entirely when the source-tree ``tools/`` directory cannot be located
-        (e.g. when Hive is installed from a wheel rather than a checkout).
-
-        Returns the list of names that were newly registered.
+        Returns the list of newly-registered server names so the CLI can
+        print them. Same idempotent seeding logic as ``initialize()``.
         """
-        self.initialize()
+        self._bootstrap_io()
+        return self._seed_defaults()
 
+    def _seed_defaults(self) -> list[str]:
+        """Idempotently register the bundled default local servers.
+
+        Skips entirely when the source-tree ``tools/`` directory cannot
+        be located (e.g. wheel installs). Returns the list of names that
+        were newly registered.
+
+        Also runs a self-heal pass over already-registered defaults: if an
+        entry's stdio cwd is unreachable on this machine (e.g. the registry
+        was copied from another developer's box and points at their
+        ``/Users/<them>/...`` path), the entry is overwritten with the
+        canonical config so the queen can actually spawn it. The user's
+        ``enabled`` toggle and ``overrides`` are preserved.
+        """
         # parents: [0]=loader, [1]=framework, [2]=core, [3]=repo root
         tools_dir = Path(__file__).resolve().parents[3] / "tools"
         if not tools_dir.is_dir():
             logger.debug(
-                "MCPRegistry.ensure_defaults: tools dir %s missing; skipping default seed",
+                "MCPRegistry._seed_defaults: tools dir %s missing; skipping default seed",
                 tools_dir,
             )
             return []
@@ -115,14 +166,37 @@ class MCPRegistry:
         for canonical, stale in _STALE_DEFAULT_ALIASES.items():
             if stale in existing and canonical not in existing:
                 logger.info(
-                    "MCPRegistry.ensure_defaults: removing stale alias '%s' (canonical: '%s')",
+                    "MCPRegistry._seed_defaults: removing stale alias '%s' (canonical: '%s')",
                     stale,
                     canonical,
                 )
                 del existing[stale]
                 mutated = True
+
+        repaired: list[str] = []
+        for name, spec in _DEFAULT_LOCAL_SERVERS.items():
+            entry = existing.get(name)
+            if entry is None:
+                continue
+            if self._default_entry_runnable(entry, tools_dir, list(spec["args"])):
+                continue
+            existing[name] = self._build_default_entry(
+                name=name,
+                spec=spec,
+                cwd=cwd,
+                preserve_from=entry,
+            )
+            repaired.append(name)
+            mutated = True
+
         if mutated:
             self._write_installed(data)
+        if repaired:
+            logger.warning(
+                "MCPRegistry._seed_defaults: repaired %d default server(s) with unreachable cwd/script: %s",
+                len(repaired),
+                repaired,
+            )
 
         for name, spec in _DEFAULT_LOCAL_SERVERS.items():
             if name in existing:
@@ -138,11 +212,96 @@ class MCPRegistry:
                 )
                 added.append(name)
             except MCPError as exc:
-                logger.warning("MCPRegistry.ensure_defaults: failed to seed '%s': %s", name, exc)
+                logger.warning("MCPRegistry._seed_defaults: failed to seed '%s': %s", name, exc)
 
         if added:
             logger.info("MCPRegistry: seeded default local servers: %s", added)
         return added
+
+    @staticmethod
+    def _default_entry_runnable(entry: dict, tools_dir: Path, canonical_args: list[str]) -> bool:
+        """Return True iff ``entry`` can plausibly be spawned on this machine.
+
+        Checks:
+        - transport is stdio (only stdio defaults exist today; non-stdio
+          gets a free pass since we have nothing to compare against)
+        - stdio.cwd is an existing directory
+        - the entry script (the first ``.py`` arg, e.g. ``files_server.py``)
+          exists relative to that cwd
+
+        We deliberately do NOT spawn the subprocess here — this runs on
+        every read path and must be cheap. A filesystem reachability
+        check catches the cross-machine `cwd` drift that is the common
+        failure, without flapping on transient runtime errors.
+        """
+        transport = entry.get("transport") or "stdio"
+        if transport != "stdio":
+            return True
+        manifest = entry.get("manifest") or {}
+        stdio = manifest.get("stdio") or {}
+        cwd_str = stdio.get("cwd")
+        if not cwd_str:
+            return False
+        cwd_path = Path(cwd_str)
+        if not cwd_path.is_dir():
+            return False
+        # Find the script: the first arg ending in .py, falling back to the
+        # canonical spec if the registered args are unrecognizable. Modules
+        # invoked via `python -m foo.bar` (no .py arg) are accepted as long
+        # as the cwd exists — we can't cheaply prove the module imports.
+        registered_args = stdio.get("args") or []
+        script: str | None = next(
+            (a for a in registered_args if isinstance(a, str) and a.endswith(".py")),
+            None,
+        )
+        if script is None:
+            script = next(
+                (a for a in canonical_args if isinstance(a, str) and a.endswith(".py")),
+                None,
+            )
+        if script is None:
+            return True
+        return (cwd_path / script).is_file()
+
+    @classmethod
+    def _build_default_entry(
+        cls,
+        *,
+        name: str,
+        spec: dict[str, Any],
+        cwd: str,
+        preserve_from: dict | None,
+    ) -> dict:
+        """Construct a fresh canonical entry for a default server.
+
+        When ``preserve_from`` is provided, carries over the user's
+        ``enabled`` flag and ``overrides`` so a deliberate disable or
+        custom env var survives the repair.
+        """
+        manifest = {
+            "name": name,
+            "description": spec["description"],
+            "transport": {"supported": ["stdio"], "default": "stdio"},
+            "stdio": {
+                "command": "uv",
+                "args": list(spec["args"]),
+                "env": {},
+                "cwd": cwd,
+            },
+        }
+        entry = cls._make_entry(
+            source="local",
+            manifest=manifest,
+            transport="stdio",
+            installed_by="hive mcp init (auto-repair)",
+        )
+        if preserve_from is not None:
+            if "enabled" in preserve_from:
+                entry["enabled"] = bool(preserve_from["enabled"])
+            prior_overrides = preserve_from.get("overrides")
+            if isinstance(prior_overrides, dict):
+                entry["overrides"] = prior_overrides
+        return entry
 
     # ── Internal I/O ────────────────────────────────────────────────
 

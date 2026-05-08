@@ -26,6 +26,10 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # Verified tools (stable, on main)
 # ---------------------------------------------------------------------------
+# File system: one canonical module for read/write/edit/search/patch.
+# Shell: still its own toolkit.
+from aden_tools.file_ops import register_file_tools
+
 from .account_info_tool import register_tools as register_account_info
 
 # ---------------------------------------------------------------------------
@@ -55,22 +59,7 @@ from .docker_hub_tool import register_tools as register_docker_hub
 from .duckduckgo_tool import register_tools as register_duckduckgo
 from .email_tool import register_tools as register_email
 from .exa_search_tool import register_tools as register_exa_search
-from .example_tool import register_tools as register_example
 from .excel_tool import register_tools as register_excel
-
-# File system toolkits
-from .file_system_toolkits.apply_diff import register_tools as register_apply_diff
-from .file_system_toolkits.apply_patch import register_tools as register_apply_patch
-from .file_system_toolkits.data_tools import register_tools as register_data_tools
-from .file_system_toolkits.execute_command_tool import (
-    register_tools as register_execute_command,
-)
-from .file_system_toolkits.grep_search import register_tools as register_grep_search
-from .file_system_toolkits.hashline_edit import register_tools as register_hashline_edit
-from .file_system_toolkits.list_dir import register_tools as register_list_dir
-from .file_system_toolkits.replace_file_content import (
-    register_tools as register_replace_file_content,
-)
 from .freshdesk_tool import register_tools as register_freshdesk
 from .github_tool import register_tools as register_github
 from .gitlab_tool import register_tools as register_gitlab
@@ -113,11 +102,11 @@ from .reddit_tool import register_tools as register_reddit
 from .redis_tool import register_tools as register_redis
 from .redshift_tool import register_tools as register_redshift
 from .risk_scorer import register_tools as register_risk_scorer
-from .runtime_logs_tool import register_tools as register_runtime_logs
 from .salesforce_tool import register_tools as register_salesforce
 from .sap_tool import register_tools as register_sap
 from .serpapi_tool import register_tools as register_serpapi
 from .shopify_tool import register_tools as register_shopify
+from .similarweb_tool import register_tools as register_similarweb
 from .slack_tool import register_tools as register_slack
 from .snowflake_tool import register_tools as register_snowflake
 from .ssl_tls_scanner import register_tools as register_ssl_tls_scanner
@@ -164,12 +153,10 @@ def _register_verified(
     """Register verified (stable) tools."""
     _verified_before = set(mcp._tool_manager._tools.keys())
     # --- No credentials ---
-    register_example(mcp)
     if register_web_scrape:
         register_web_scrape(mcp)
     register_pdf_read(mcp)
     register_time(mcp)
-    register_runtime_logs(mcp)
     register_wikipedia(mcp)
     register_arxiv(mcp)
 
@@ -201,16 +188,12 @@ def _register_verified(
     register_google_sheets(mcp, credentials=credentials)
     register_account_info(mcp, credentials=credentials)
 
-    # --- File system toolkits ---
-    register_list_dir(mcp)
-    register_replace_file_content(mcp)
-    register_apply_diff(mcp)
-    register_apply_patch(mcp)
-    register_grep_search(mcp)
-    # hashline_edit: anchor-based editing, pairs with read_file/grep_search hashline mode
-    register_hashline_edit(mcp)
-    register_execute_command(mcp)
-    register_data_tools(mcp)
+    # --- File system + shell ---
+    # File tools (read_file, write_file, edit_file, hashline_edit,
+    # search_files, apply_patch) all share one path policy. ``home``
+    # defaults to CWD here; framework callers that own a session-specific
+    # workspace should call register_file_tools directly with home set.
+    register_file_tools(mcp)
     register_csv(mcp)
     register_excel(mcp)
 
@@ -320,6 +303,7 @@ def _register_unverified(
     register_salesforce(mcp, credentials=credentials)
     register_sap(mcp, credentials=credentials)
     register_shopify(mcp, credentials=credentials)
+    register_similarweb(mcp, credentials=credentials)
     register_snowflake(mcp, credentials=credentials)
     register_supabase(mcp, credentials=credentials)
     register_terraform(mcp, credentials=credentials)

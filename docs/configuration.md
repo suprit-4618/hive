@@ -115,7 +115,7 @@ Hive LLM:
 Notes:
 
 - Set `provider` to `hive`
-- Common Hive model values are `queen`, `kimi-2.5`, and `GLM-5`
+- Common Hive model values are `queen`, `kimi-k2.5`, and `GLM-5`
 - Hive LLM requests use the Hive endpoint at `https://api.adenhq.com`
 
 ### Search & Tools (optional)
@@ -184,9 +184,9 @@ MCP (Model Context Protocol) servers are configured in `.mcp.json` at the projec
 ```json
 {
   "mcpServers": {
-    "coder-tools": {
+    "files-tools": {
       "command": "uv",
-      "args": ["run", "coder_tools_server.py", "--stdio"],
+      "args": ["run", "files_server.py", "--stdio"],
       "cwd": "tools"
     },
     "tools": {
@@ -198,7 +198,7 @@ MCP (Model Context Protocol) servers are configured in `.mcp.json` at the projec
 }
 ```
 
-The `coder-tools` server provides agent scaffolding via `initialize_and_build_agent` and related tools. The `tools` MCP server exposes tools including web search, PDF reading, CSV processing, and file system operations.
+The `files-tools` server exposes file I/O (`read_file`, `write_file`, `edit_file`, `hashline_edit`, `search_files`). The `tools` MCP server exposes integration tools including web search, PDF reading, CSV processing, and file system operations.
 
 ## Storage
 

@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { Loader2, Minus, Plus } from "lucide-react";
+import { Minus, Plus } from "lucide-react";
 import ChatPanel, {
   type ChatMessage,
   type ImageContent,
@@ -14,10 +14,12 @@ import { usePendingQueue } from "@/hooks/use-pending-queue";
 import type { AgentEvent, HistorySession } from "@/api/types";
 import {
   newReplayState,
+  newTokenAccumulator,
   replayEvent,
   replayEventsToMessages,
 } from "@/lib/chat-helpers";
 import { useColony } from "@/context/ColonyContext";
+import { useColonyWorkers } from "@/context/ColonyWorkersContext";
 import { useHeaderActions } from "@/context/HeaderActionsContext";
 import { getQueenForAgent, slugToColonyId } from "@/lib/colony-registry";
 
@@ -71,7 +73,17 @@ export default function QueenDM() {
     { id: string; prompt: string; options?: string[] }[] | null
   >(null);
   const [awaitingInput, setAwaitingInput] = useState(false);
-  const [tokenUsage, setTokenUsage] = useState({ input: 0, output: 0 });
+  // `cached` and `cacheCreated` are subsets of `input` (providers count both
+  // inside prompt_tokens already) — display them, never add them to a total.
+  // `costUsd` is the session-total USD cost when the provider supplies one
+  // (Anthropic, OpenAI, OpenRouter); 0 means unreported, not free.
+  const [tokenUsage, setTokenUsage] = useState({
+    input: 0,
+    output: 0,
+    cached: 0,
+    cacheCreated: 0,
+    costUsd: 0,
+  });
   const [historySessions, setHistorySessions] = useState<HistorySession[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [switchingSessionId, setSwitchingSessionId] = useState<string | null>(
@@ -105,9 +117,25 @@ export default function QueenDM() {
   // client_input_requested so we don't flicker the typing bubble off while
   // the queen is about to resume on the flushed input.
   const queenAboutToResumeRef = useRef(false);
+  // Question bubble for an ask_user that's actively awaiting an answer. We
+  // stash it here instead of pushing it into messages so the user only sees
+  // ONE copy of the question (the popup widget) while answering. Committed
+  // to the transcript on client_input_received so the bubble lands right
+  // above the user's answer for scroll-back context.
+  const pendingAskUserBubbleRef = useRef<ChatMessage | null>(null);
   const [queenPhase, setQueenPhase] = useState<
     "independent" | "incubating" | "working" | "reviewing"
   >("independent");
+
+  // Publish the active session id into the shared workers/tasks context
+  // so AppLayout's right-rail TaskListPanel can attach to it. The colony
+  // workers panel itself stays hidden in queen-DM because we don't set
+  // colonyName (AppLayout requires both — see LayoutShell).
+  const { setSessionId: setCtxSessionId } = useColonyWorkers();
+  useEffect(() => {
+    setCtxSessionId(sessionId ?? null);
+    return () => setCtxSessionId(null);
+  }, [sessionId, setCtxSessionId]);
 
   const resetViewState = useCallback(() => {
     setSessionId(null);
@@ -118,7 +146,7 @@ export default function QueenDM() {
     setPendingQuestions(null);
     setAwaitingInput(false);
     setQueenPhase("independent");
-    setTokenUsage({ input: 0, output: 0 });
+    setTokenUsage({ input: 0, output: 0, cached: 0, cacheCreated: 0, costUsd: 0 });
     setInitialDraft(null);
     setColonySpawned(false);
     setSpawnedColonyName(null);
@@ -175,16 +203,34 @@ export default function QueenDM() {
 
         // Use the stateful replay so tool_status pills are synthesized
         // the same way the live SSE handler does — without this the
-        // refreshed queen DM shows zero tool activity.
+        // refreshed queen DM shows zero tool activity. The token
+        // accumulator folds the llm_turn_complete sum into the same
+        // pass so we don't iterate the (potentially large) event array
+        // twice. SSE does not replay llm_turn_complete (see
+        // routes_events.py _REPLAY_TYPES), so no double-count risk —
+        // live SSE deltas that may have already landed are kept via the
+        // functional merge below.
         const replayState = newReplayState();
+        const seed = newTokenAccumulator();
         const restored = replayEventsToMessages(
           events,
           "queen-dm",
           queenName,
           undefined,
           replayState,
+          seed,
         );
         replayStateRef.current = replayState;
+
+        if (!cancelled()) {
+          setTokenUsage((prev) => ({
+            input: prev.input + seed.input,
+            output: prev.output + seed.output,
+            cached: prev.cached + seed.cached,
+            cacheCreated: prev.cacheCreated + seed.cacheCreated,
+            costUsd: prev.costUsd + seed.costUsd,
+          }));
+        }
 
         // Show a banner if the server truncated older events.
         const droppedCount = Math.max(0, total - returned);
@@ -501,19 +547,11 @@ export default function QueenDM() {
 
   const handleCreateNewSession = useCallback(() => {
     if (!queenId) return;
-    setCreatingNewSession(true);
-    const request = queensApi.createNewSession(
-      queenId,
-      undefined,
-      "independent",
-    );
-    request
-      .then((result) => {
-        setSearchParams({ session: result.session_id });
-      })
-      .catch(() => {
-        setCreatingNewSession(false);
-      });
+    // Bounce through the ?new=1 bootstrap path so the chat shell appears
+    // immediately with a typing indicator while createNewSession runs in
+    // the background. URL is replaced with ?session=<id> when it resolves.
+    // Avoids the 5s "nothing happens, then chat appears" dead window.
+    setSearchParams({ new: "1" });
   }, [queenId, setSearchParams]);
 
   useEffect(() => {
@@ -576,7 +614,18 @@ export default function QueenDM() {
           if (event.data) {
             const inp = (event.data.input_tokens as number) || 0;
             const out = (event.data.output_tokens as number) || 0;
-            setTokenUsage((prev) => ({ input: prev.input + inp, output: prev.output + out }));
+            // cached / cache_creation are subsets of input — accumulate
+            // separately for display, do NOT roll into input/total.
+            const cached = (event.data.cached_tokens as number) || 0;
+            const cacheCreated = (event.data.cache_creation_tokens as number) || 0;
+            const costUsd = (event.data.cost_usd as number) || 0;
+            setTokenUsage((prev) => ({
+              input: prev.input + inp,
+              output: prev.output + out,
+              cached: prev.cached + cached,
+              cacheCreated: prev.cacheCreated + cacheCreated,
+              costUsd: prev.costUsd + costUsd,
+            }));
           }
           // Flush one queued message per LLM turn boundary. This is the
           // real "turn ended" signal in a queen DM — execution_completed
@@ -611,6 +660,14 @@ export default function QueenDM() {
             queenAboutToResumeRef.current = false;
             break;
           }
+          // Stash the question bubble (synthesized by replayEvent) instead
+          // of upserting now: while the popup widget is open the user only
+          // wants to see ONE copy of the question. We commit the bubble on
+          // client_input_received so it lands right above the user's
+          // answer in the transcript.
+          if (emittedMessages.length > 0) {
+            pendingAskUserBubbleRef.current = emittedMessages[0];
+          }
           setAwaitingInput(true);
           setIsTyping(false);
           setIsStreaming(false);
@@ -619,6 +676,14 @@ export default function QueenDM() {
         }
 
         case "client_input_received": {
+          // Commit the stashed ask_user bubble first so it appears above
+          // the user's reply in scroll-back. Its createdAt predates this
+          // event's, so the timestamp-ordered insert in upsertMessage
+          // places it correctly.
+          if (pendingAskUserBubbleRef.current) {
+            upsertMessage(pendingAskUserBubbleRef.current);
+            pendingAskUserBubbleRef.current = null;
+          }
           for (const msg of emittedMessages) {
             upsertMessage(msg, { reconcileOptimisticUser: true });
           }
@@ -867,19 +932,6 @@ export default function QueenDM() {
     <div className="flex flex-col h-full">
       {/* Chat */}
       <div className="flex-1 min-h-0 relative">
-        {loading && (
-          <div className="absolute inset-0 z-10 flex items-center justify-center bg-background/60 backdrop-blur-sm">
-            <div className="flex items-center gap-3 text-muted-foreground">
-              <Loader2 className="w-5 h-5 animate-spin" />
-              <span className="text-sm">
-                {selectedSessionParam?.startsWith("session_")
-                  ? "Connecting to session..."
-                  : `Connecting to ${queenName}...`}
-              </span>
-            </div>
-          </div>
-        )}
-
         <ChatPanel
           messages={messages}
           onSend={handleSend}
@@ -889,7 +941,10 @@ export default function QueenDM() {
           activeThread="queen-dm"
           isWaiting={isTyping && !isStreaming}
           isBusy={isTyping}
-          disabled={loading || !queenReady}
+          // Keep the textarea typable while the queen is warming up so the
+          // user can compose a follow-up immediately. Send stays locked
+          // until the session is live and the queen is ready.
+          sendLocked={loading || !queenReady}
           queenPhase={queenPhase}
           showQueenPhaseBadge
           pendingQuestions={awaitingInput ? pendingQuestions : null}

@@ -146,7 +146,7 @@ def write_skill(
 
     ``target_root`` is the parent scope dir (e.g.
     ``~/.hive/agents/queens/{id}/skills`` or
-    ``{colony_dir}/.hive/skills``). The function creates it if needed.
+    ``{colony_dir}/skills``). The function creates it if needed.
 
     Returns ``(installed_path, error, replaced)``. On success ``error`` is
     ``None``; on failure ``installed_path`` is ``None`` and the target is

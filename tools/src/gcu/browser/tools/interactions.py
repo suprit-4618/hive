@@ -104,7 +104,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
         button: Literal["left", "right", "middle"] = "left",
         double_click: bool = False,
         timeout_ms: int = 5000,
-        auto_snapshot_mode: AutoSnapshotMode = "default",
+        auto_snapshot_mode: AutoSnapshotMode = "simple",
     ) -> dict:
         """
         Click an element on the page.
@@ -123,12 +123,14 @@ def register_interaction_tools(mcp: FastMCP) -> None:
                 element will take longer than 5s to render — for example
                 right after a navigation that triggers slow hydration.
             auto_snapshot_mode: Controls the accessibility snapshot taken
-                0.5s after a successful click. ``"default"`` (the default)
-                returns the full tree; ``"simple"`` trims unnamed structural
-                nodes; ``"interactive"`` returns only controls (buttons,
-                links, inputs) for the tightest token footprint;
-                ``"off"`` skips the capture entirely — use when batching
-                multiple interactions.
+                0.5s after a successful click. ``"simple"`` (the default)
+                trims unnamed structural nodes — keeps interactive elements
+                and named landmarks/content; ``"default"`` returns the full
+                tree (use when you need the structural skeleton);
+                ``"interactive"`` returns only controls (buttons, links,
+                inputs) for the tightest token footprint; ``"off"`` skips
+                the capture entirely — use when batching multiple
+                interactions.
 
         Returns:
             Dict with click result and coordinates. Includes ``snapshot``
@@ -151,7 +153,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_click", params, result=result)
             return result
 
@@ -245,7 +247,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_click_coordinate", params, result=result)
             return _text_only(result)
 
@@ -305,7 +307,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
         clear_first: bool = True,
         timeout_ms: int = 30000,
         use_insert_text: bool = True,
-        auto_snapshot_mode: AutoSnapshotMode = "default",
+        auto_snapshot_mode: AutoSnapshotMode = "simple",
     ) -> dict:
         """
         Click a selector to focus it, then type text into it.
@@ -328,11 +330,12 @@ def register_interaction_tools(mcp: FastMCP) -> None:
                 reliable insertion into rich-text editors. Set False for
                 per-keystroke dispatch.
             auto_snapshot_mode: Controls the accessibility snapshot taken
-                0.5s after successful typing. ``"default"`` returns the
-                full tree; ``"simple"`` trims unnamed structural nodes;
-                ``"interactive"`` returns only controls for the tightest
-                token footprint; ``"off"`` skips the capture entirely —
-                use when batching multiple interactions.
+                0.5s after successful typing. ``"simple"`` (the default)
+                trims unnamed structural nodes — keeps interactive elements
+                and named landmarks/content; ``"default"`` returns the full
+                tree; ``"interactive"`` returns only controls for the
+                tightest token footprint; ``"off"`` skips the capture
+                entirely — use when batching multiple interactions.
 
         Returns:
             Dict with type result. Includes ``snapshot`` unless
@@ -349,7 +352,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_type", params, result=result)
             return result
 
@@ -382,46 +385,6 @@ def register_interaction_tools(mcp: FastMCP) -> None:
             return result
 
     @mcp.tool()
-    async def browser_fill(
-        selector: str,
-        value: str,
-        tab_id: int | None = None,
-        profile: str | None = None,
-        timeout_ms: int = 30000,
-        auto_snapshot_mode: AutoSnapshotMode = "default",
-    ) -> dict:
-        """
-        Fill an input element with a value (clears existing content first).
-
-        Faster than browser_type for filling form fields.
-
-        Args:
-            selector: CSS selector for the input element
-            value: Value to fill
-            tab_id: Chrome tab ID (default: active tab)
-            profile: Browser profile name (default: "default")
-            timeout_ms: Timeout waiting for element (default: 30000)
-            auto_snapshot_mode: Controls the accessibility snapshot taken
-                0.5s after a successful fill. ``"default"`` returns the
-                full tree; ``"simple"`` / ``"interactive"`` return tighter
-                trees; ``"off"`` skips the capture — use when batching.
-
-        Returns:
-            Dict with fill result. Includes ``snapshot`` unless
-            ``auto_snapshot_mode="off"`` or the fill failed.
-        """
-        return await browser_type(
-            selector=selector,
-            text=value,
-            tab_id=tab_id,
-            profile=profile,
-            delay_ms=0,
-            clear_first=True,
-            timeout_ms=timeout_ms,
-            auto_snapshot_mode=auto_snapshot_mode,
-        )
-
-    @mcp.tool()
     async def browser_type_focused(
         text: str,
         tab_id: int | None = None,
@@ -429,7 +392,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
         delay_ms: int = 1,
         clear_first: bool = True,
         use_insert_text: bool = True,
-        auto_snapshot_mode: AutoSnapshotMode = "default",
+        auto_snapshot_mode: AutoSnapshotMode = "simple",
     ) -> dict:
         """
         Type text into the already-focused element.
@@ -448,9 +411,11 @@ def register_interaction_tools(mcp: FastMCP) -> None:
             clear_first: Clear existing text before typing (default: True).
             use_insert_text: Use CDP Input.insertText (default: True).
             auto_snapshot_mode: Controls the accessibility snapshot taken
-                0.5s after successful typing. ``"default"`` returns the
-                full tree; ``"simple"`` / ``"interactive"`` return tighter
-                trees; ``"off"`` skips the capture — use when batching.
+                0.5s after successful typing. ``"simple"`` (the default)
+                trims unnamed structural nodes; ``"default"`` returns the
+                full tree; ``"interactive"`` returns only controls for the
+                tightest token footprint; ``"off"`` skips the capture —
+                use when batching.
 
         Returns:
             Dict with type result. Includes ``snapshot`` unless
@@ -467,7 +432,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_type_focused", params, result=result)
             return result
 
@@ -541,7 +506,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_press", params, result=result)
             return result
 
@@ -595,7 +560,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_hover", params, result=result)
             return result
 
@@ -662,7 +627,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_hover_coordinate", params, result=result)
             return _text_only(result)
 
@@ -747,7 +712,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_press_at", params, result=result)
             return _text_only(result)
 
@@ -817,7 +782,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_select", params, result=result)
             return result
 
@@ -845,31 +810,47 @@ def register_interaction_tools(mcp: FastMCP) -> None:
     async def browser_scroll(
         direction: Literal["up", "down", "left", "right"] = "down",
         amount: int = 500,
+        selector: str | None = None,
         tab_id: int | None = None,
         profile: str | None = None,
-        auto_snapshot_mode: AutoSnapshotMode = "default",
+        auto_snapshot_mode: AutoSnapshotMode = "simple",
     ) -> dict:
         """
-        Scroll the page.
+        Scroll the page or a specific scrollable container.
 
         Args:
             direction: Scroll direction (up, down, left, right)
             amount: Scroll amount in pixels (default: 500)
+            selector: Optional CSS selector for the container to scroll.
+                Supports '>>>' shadow-piercing selectors. When omitted,
+                the tool picks the scrollable container at the viewport
+                center, then falls back to the largest visible
+                scrollable element, then to the window. Use this when
+                auto-pick scrolls the wrong area (e.g. nested panels,
+                modals over a long page, chat history beside a sidebar).
             tab_id: Chrome tab ID (default: active tab)
             profile: Browser profile name (default: "default")
             auto_snapshot_mode: Controls the accessibility snapshot taken
-                0.5s after a successful scroll. ``"default"`` returns the
-                full tree; ``"simple"`` / ``"interactive"`` return tighter
-                trees — useful on virtual-scroll UIs that produce huge
-                default trees; ``"off"`` skips the capture — use when
-                issuing many scrolls in a row.
+                0.5s after a successful scroll. ``"simple"`` (the default)
+                trims unnamed structural nodes — well-suited to virtual-
+                scroll UIs that produce huge default trees; ``"interactive"``
+                tightens further to controls only; ``"default"`` returns
+                the full tree (use when you need the structural skeleton);
+                ``"off"`` skips the capture — use when issuing many scrolls
+                in a row.
 
         Returns:
             Dict with scroll result. Includes ``snapshot`` unless
             ``auto_snapshot_mode="off"`` or the scroll failed.
         """
         start = time.perf_counter()
-        params = {"direction": direction, "amount": amount, "tab_id": tab_id, "profile": profile}
+        params = {
+            "direction": direction,
+            "amount": amount,
+            "selector": selector,
+            "tab_id": tab_id,
+            "profile": profile,
+        }
 
         bridge = get_bridge()
         if not bridge or not bridge.is_connected:
@@ -879,7 +860,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_scroll", params, result=result)
             return result
 
@@ -890,7 +871,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
             return result
 
         try:
-            scroll_result = await bridge.scroll(target_tab, direction=direction, amount=amount)
+            scroll_result = await bridge.scroll(target_tab, direction=direction, amount=amount, selector=selector)
             log_tool_call(
                 "browser_scroll",
                 params,
@@ -943,7 +924,7 @@ def register_interaction_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_drag", params, result=result)
             return result
 

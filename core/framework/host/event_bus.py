@@ -42,7 +42,9 @@ def _open_event_log() -> IO[str] | None:
         return None
     raw = _DEBUG_EVENTS_RAW
     if raw.lower() in ("1", "true", "full"):
-        log_dir = Path.home() / ".hive" / "event_logs"
+        from framework.config import HIVE_HOME
+
+        log_dir = HIVE_HOME / "event_logs"
     else:
         log_dir = Path(raw)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -164,6 +166,14 @@ class EventType(StrEnum):
     TRIGGER_FIRED = "trigger_fired"
     TRIGGER_REMOVED = "trigger_removed"
     TRIGGER_UPDATED = "trigger_updated"
+
+    # Task system lifecycle (per-list diffs streamed to the UI)
+    TASK_CREATED = "task_created"
+    TASK_UPDATED = "task_updated"
+    TASK_DELETED = "task_deleted"
+    TASK_LIST_RESET = "task_list_reset"
+    TASK_LIST_REATTACH_MISMATCH = "task_list_reattach_mismatch"
+    COLONY_TEMPLATE_ASSIGNMENT = "colony_template_assignment"
 
 
 @dataclass
@@ -809,16 +819,28 @@ class EventBus:
         input_tokens: int,
         output_tokens: int,
         cached_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+        cost_usd: float = 0.0,
         execution_id: str | None = None,
         iteration: int | None = None,
     ) -> None:
-        """Emit LLM turn completion with stop reason and model metadata."""
+        """Emit LLM turn completion with stop reason and model metadata.
+
+        ``cached_tokens`` and ``cache_creation_tokens`` are subsets of
+        ``input_tokens`` (already inside provider ``prompt_tokens``).
+        Subscribers should display them, not add them to a total.
+
+        ``cost_usd`` is the USD cost for this turn when known (Anthropic,
+        OpenAI, OpenRouter). 0.0 means unreported (not free).
+        """
         data: dict = {
             "stop_reason": stop_reason,
             "model": model,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cached_tokens": cached_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
+            "cost_usd": cost_usd,
         }
         if iteration is not None:
             data["iteration"] = iteration

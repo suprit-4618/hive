@@ -20,6 +20,7 @@ from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlparse
 
+from framework.config import HIVE_HOME
 from framework.skills.parser import ParsedSkill
 
 logger = logging.getLogger(__name__)
@@ -30,8 +31,11 @@ _ENV_TRUST_ALL = "HIVE_TRUST_PROJECT_SKILLS"
 # Env var for comma-separated own-remote glob patterns (e.g. "github.com/myorg/*").
 _ENV_OWN_REMOTES = "HIVE_OWN_REMOTES"
 
-_TRUSTED_REPOS_PATH = Path.home() / ".hive" / "trusted_repos.json"
-_NOTICE_SENTINEL_PATH = Path.home() / ".hive" / ".skill_trust_notice_shown"
+# Persisted store of trusted git remotes (one-shot consent per repo).
+_TRUSTED_REPOS_PATH = HIVE_HOME / "trusted_repos.json"
+
+# Sentinel for the one-time security notice (NFR-5).
+_NOTICE_SENTINEL_PATH = HIVE_HOME / ".skill_trust_notice_shown"
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +228,9 @@ class ProjectTrustDetector:
             patterns.extend(p.strip() for p in raw.split(",") if p.strip())
 
         # From ~/.hive/own_remotes file
-        own_remotes_file = Path.home() / ".hive" / "own_remotes"
+        from framework.config import HIVE_HOME
+
+        own_remotes_file = HIVE_HOME / "own_remotes"
         if own_remotes_file.is_file():
             try:
                 for line in own_remotes_file.read_text(encoding="utf-8").splitlines():
@@ -415,7 +421,8 @@ class TrustGate:
 
     def _maybe_show_security_notice(self, Colors) -> None:  # noqa: N803
         """Show the one-time security notice if not already shown (NFR-5)."""
-        if _NOTICE_SENTINEL_PATH.exists():
+        sentinel = _NOTICE_SENTINEL_PATH
+        if sentinel.exists():
             return
         self._print("")
         self._print(
@@ -427,8 +434,8 @@ class TrustGate:
         )
         self._print("")
         try:
-            _NOTICE_SENTINEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _NOTICE_SENTINEL_PATH.touch()
+            sentinel.parent.mkdir(parents=True, exist_ok=True)
+            sentinel.touch()
         except OSError:
             pass
 
